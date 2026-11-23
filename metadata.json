@@ -1,0 +1,8 @@
+{
+  "name": "Sons of Anarcreepy: Cryptids & Chrome",
+  "description": "Ride custom motorcycles as folklore monsters and cryptids, terrify townsfolk down midnight highways, and unlock faster bikes, custom parts, scare powers, and accessories.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
