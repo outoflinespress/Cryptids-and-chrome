@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { soundEngine } from './audio';
+import { soundEngine, type SpatialSirenSource } from './audio';
 import {
   computeLoadoutStats,
   getBike,
@@ -46,6 +46,7 @@ const CALLOUT_MAX_QUEUE = 6;
 const HIJACK_RANGE_AHEAD = 26;
 const HIJACK_RANGE_BEHIND = 9;
 const HIJACK_MAX_DX = 7.5;
+const HIJACK_COOLDOWN_SEC = 20; // ~3 hijacks per minute max
 const RESCUE_RANGE_AHEAD = 28;
 const RESCUE_RANGE_BEHIND = 11;
 const RESCUE_MAX_DX = 11.5;
@@ -67,6 +68,29 @@ interface SparkParticle {
   maxAge: number;
 }
 
+interface ThrownDriverFX {
+  group: THREE.Group;
+  body: THREE.Group;
+  leftArm: THREE.Object3D;
+  rightArm: THREE.Object3D;
+  leftLeg: THREE.Object3D;
+  rightLeg: THREE.Object3D;
+  screamSprite: THREE.Sprite;
+  grabArm: THREE.Group;
+  throwSide: number;
+  startY: number;
+  age: number;
+  grabDuration: number;
+  maxAge: number;
+  released: boolean;
+  pos: THREE.Vector3;
+  vel: THREE.Vector3;
+  rotVel: THREE.Vector3;
+  bounces: number;
+  hitVehicleIds: Set<number>;
+  sparkAccum: number;
+}
+
 export type TouchControlId = 'left' | 'right' | 'throttle' | 'brake';
 
 export interface EngineCallbacks {
@@ -77,6 +101,7 @@ export interface EngineCallbacks {
 }
 
 const HUMAN_CAR_COLORS = [0x3b82f6, 0xef4444, 0x10b981, 0xf59e0b, 0x8b5cf6, 0xec4899, 0x06b6d4];
+const WANTED_THRESHOLDS = [0, 15, 42, 76, 118, 165];
 
 export class CryptidGame3DEngine {
   private container: HTMLElement;
@@ -95,6 +120,11 @@ export class CryptidGame3DEngine {
   private monsterRig!: MonsterRig;
   private hijackBustRig!: MonsterRig;
   private stolenVehicleGroup: THREE.Group | null = null;
+  private stolenPoliceStrobes: {
+    l?: THREE.Mesh;
+    r?: THREE.Mesh;
+    pool?: THREE.Mesh;
+  } | null = null;
   private actorRoot = new THREE.Group();
   private trafficRoot = new THREE.Group();
 
@@ -113,14 +143,24 @@ export class CryptidGame3DEngine {
   private wheelieTimer = 0;
   private loomTimer = 0;
   private leapAnimTimer = 0;
+  private hijackThrowTimer = 0;
+  private hijackThrowSide = 1;
   private footRunCycle = 0;
   private controlMode: VehicleControlMode = 'own_bike';
   private hijackTarget: HighwayVehicle | null = null;
+  private thrownDrivers: ThrownDriverFX[] = [];
+  private driverFaceTex: THREE.CanvasTexture | null = null;
+  private screamTagTextures = new Map<string, THREE.CanvasTexture>();
 
-  // Traffic & Captive Truck
+  // Traffic, Police Pursuit & Captive Truck
   private vehicles: HighwayVehicle[] = [];
   private nextVehicleId = 1;
   private vehicleSpawnTimer = 0;
+  private policeSpawnTimer = 0;
+  private wantedHeat = 0;
+  private wantedStars = 0;
+  private wantedCoolTimer = 0;
+  private policeChasingCount = 0;
   private runElapsed = 0;
   private captiveTruck: CaptiveTruck | null = null;
   private captiveSpawnTimer = 10; // First Captive Truck appears quickly!
@@ -129,6 +169,7 @@ export class CryptidGame3DEngine {
   private hp = 4;
   private maxHp = 4;
   private invulnTimer = 0;
+  private damageFlash = 0;
   private hitstopTimer = 0;
   private shakeIntensity = 0;
   private distanceMeters = 0;
@@ -157,6 +198,7 @@ export class CryptidGame3DEngine {
     hellfire_scorch: 0,
   };
   private signatureCooldown = 0;
+  private hijackCooldown = 0;
   private selectedScare: ScareMechanicId = 'thunder_rev';
   private statusToast: string | null = null;
   private statusToastTimer = 0;
@@ -528,6 +570,7 @@ export class CryptidGame3DEngine {
     this.maxHp = this.stats.maxHp;
     this.hp = this.maxHp;
     this.invulnTimer = 0;
+    this.damageFlash = 0;
     this.hitstopTimer = 0;
     this.shakeIntensity = 0;
     this.distanceMeters = 0;
@@ -549,24 +592,37 @@ export class CryptidGame3DEngine {
 
     for (const m of SCARE_MECHANICS) this.scareCooldowns[m.id] = 0;
     this.signatureCooldown = 0;
+    this.hijackCooldown = 0;
     this.callouts = [];
 
-    // Clear existing traffic & captive truck
+    // Clear existing traffic, captive truck & any flying drivers
     for (const v of this.vehicles) this.trafficRoot.remove(v.group);
     this.vehicles = [];
+    for (const td of this.thrownDrivers) {
+      this.scene.remove(td.group);
+      this.scene.remove(td.grabArm);
+    }
+    this.thrownDrivers = [];
+    this.hijackThrowTimer = 0;
     if (this.captiveTruck) {
       this.trafficRoot.remove(this.captiveTruck.group);
       this.captiveTruck = null;
     }
     this.vehicleSpawnTimer = 0.25;
+    this.policeSpawnTimer = 0.9;
+    this.wantedHeat = 0;
+    this.wantedStars = 0;
+    this.wantedCoolTimer = 0;
+    this.policeChasingCount = 0;
+    soundEngine.clearSpatialSirens();
     this.runElapsed = 0;
     this.captiveSpawnTimer = 10.5; // First captive rescue truck rolls in ~10s!
 
-    // Populate the opening highway stretch immediately with 9 well-spaced civilian vehicles
-    // so the player has plenty of targets to scare and weave around from second one!
-    const openingZs = [-22, -36, -50, -64, -78, -94, -110, -126, -142];
+    // Populate the opening highway stretch with 6 well-spaced civilian vehicles
+    // so there are immediate targets ahead with clean lanes to weave through
+    const openingZs = [-28, -48, -68, -90, -112, -134];
     for (let i = 0; i < openingZs.length; i++) {
-      this.spawnHumanVehicle(openingZs[i], i < 6);
+      this.spawnHumanVehicle(openingZs[i], i < 4);
     }
 
     this.setToast('Scare drivers to 100% Panic to wreck them — press F beside cars to HIJACK!', 4.2);
@@ -605,6 +661,7 @@ export class CryptidGame3DEngine {
       this.actorRoot.remove(this.stolenVehicleGroup);
       this.stolenVehicleGroup = null;
     }
+    this.stolenPoliceStrobes = null;
   }
 
   private attachMonsterForMode(mode: VehicleControlMode): void {
@@ -764,15 +821,26 @@ export class CryptidGame3DEngine {
       return;
     }
 
-    // 2. Otherwise prioritize hijacking any vehicle in range (never drop on foot if a target is near!)
+    // 2. Otherwise prioritize hijacking any vehicle in range (subject to ~3/min hijack cooldown!)
     const target =
       this.hijackTarget && this.isVehicleHijackable(this.hijackTarget)
         ? this.hijackTarget
         : this.findBestHijackTarget();
     if (target) {
-      this.performVehicleHijack(target);
-      this.hudThrottle = 0.065;
-      return;
+      if (this.hijackCooldown > 0) {
+        if (this.controlMode !== 'on_foot') {
+          const secs = Math.ceil(this.hijackCooldown);
+          soundEngine.playGarageClick();
+          this.setToast(`Hijack recharging — ready in ${secs}s!`, 1.8);
+          this.hudThrottle = 0.065;
+          return;
+        }
+        // If on foot while hijack is cooling down, fall through so player can recall their bike safely!
+      } else {
+        this.performVehicleHijack(target);
+        this.hudThrottle = 0.065;
+        return;
+      }
     }
 
     // 3. Only toggle Own Custom Bike <-> On-Foot when NO rescue or hijack target is in range!
@@ -804,12 +872,14 @@ export class CryptidGame3DEngine {
       sedan: 'stolen_sedan',
       muscle: 'stolen_muscle',
       van: 'stolen_van',
+      police: 'stolen_police',
       bike: 'stolen_bike',
     };
     const labelMap: Record<HumanVehicleKind, string> = {
       sedan: 'STOLEN SEDAN',
       muscle: 'STOLEN MUSCLE CAR',
       van: 'STOLEN SKEPTIC VAN',
+      police: 'STOLEN POLICE CRUISER',
       bike: 'STOLEN STREETBIKE',
     };
 
@@ -817,9 +887,12 @@ export class CryptidGame3DEngine {
     this.playerX = target.x;
     this.hijackedCount++;
     const comboMult = this.advanceCombo(1);
-    const bonus = Math.round(90 * this.stats.dreadMultiplier * (1 + Math.min(1.5, (comboMult - 1) * 0.5)));
+    const baseHijackBonus = target.kind === 'police' ? 150 : 90;
+    const bonus = Math.round(
+      baseHijackBonus * this.stats.dreadMultiplier * (1 + Math.min(1.5, (comboMult - 1) * 0.5)),
+    );
     this.dreadThisRun += bonus;
-    this.nitroFrac = Math.min(1, this.nitroFrac + 0.22);
+    this.nitroFrac = Math.min(1, this.nitroFrac + 0.25);
 
     // Replace player's vehicle cleanly (never leave two vehicles stacked!)
     this.clearStolenVehicleMesh();
@@ -827,11 +900,13 @@ export class CryptidGame3DEngine {
 
     if (target.kind !== 'bike') {
       const stolenColor =
-        target.kind === 'van'
-          ? 0xfacc15
-          : target.kind === 'muscle'
-            ? 0xff2a54
-            : 0x6366f1;
+        target.kind === 'police'
+          ? 0x0f172a
+          : target.kind === 'van'
+            ? 0xfacc15
+            : target.kind === 'muscle'
+              ? 0xff2a54
+              : 0x6366f1;
       const built = buildHumanVehicleMesh(target.kind, stolenColor);
       built.panicBarBg.visible = false;
       built.panicBarFill.visible = false;
@@ -839,11 +914,19 @@ export class CryptidGame3DEngine {
       if (built.shieldRing) built.shieldRing.visible = false;
       if (built.spotlightCone) built.spotlightCone.visible = false;
 
+      if (target.kind === 'police') {
+        this.stolenPoliceStrobes = {
+          l: built.policeStrobeL,
+          r: built.policeStrobeR,
+          pool: built.policeGlowPool,
+        };
+      }
+
       // Subtle hijacked underglow ring so the player's stolen ride pops cleanly
       const hijackGlow = new THREE.Mesh(
         new THREE.CircleGeometry(target.kind === 'van' ? 2.4 : 2.1, 24),
         new THREE.MeshBasicMaterial({
-          color: 0x8cff2e,
+          color: target.kind === 'police' ? 0x3b82f6 : 0x8cff2e,
           transparent: true,
           opacity: 0.24,
           depthWrite: false,
@@ -868,21 +951,31 @@ export class CryptidGame3DEngine {
     if (targetIdx !== -1) this.vehicles.splice(targetIdx, 1);
     this.hijackTarget = null;
 
-    this.leapAnimTimer = 0.45;
+    this.hijackCooldown = HIJACK_COOLDOWN_SEC;
+    this.leapAnimTimer = 0.42;
     this.shakeIntensity = 0.38;
     this.hitstopTimer = 0.035;
     soundEngine.playHijackLeap();
 
+    // Visibly grab and hurl the terrified human driver forward into highway traffic!
+    this.spawnThrownDriver(target.kind);
+
     _v1.set(this.playerX, 1.0, 0);
-    this.spawnSparkBurst(_v1, '#8CFF2E', 14);
+    this.spawnSparkBurst(_v1, target.kind === 'police' ? '#3B82F6' : '#8CFF2E', 14);
     this.pushCallout(
       `HIJACKED ${labelMap[target.kind]}!`,
-      `+${bonus} DREAD · DRIVER EJECTED!`,
-      '#8CFF2E',
+      `+${bonus} DREAD · DRIVER TOSSED INTO TRAFFIC!`,
+      target.kind === 'police' ? '#3B82F6' : '#8CFF2E',
       50,
       38,
     );
-    this.setToast(`Driving ${labelMap[target.kind]} — Press F to leap onto another ride or bail!`, 2.8);
+    this.setToast(`Driving ${labelMap[target.kind]} — Next hijack ready in ${HIJACK_COOLDOWN_SEC}s!`, 2.8);
+
+    // Raise Wanted Level & dispatch police pursuit!
+    this.addWantedHeat(
+      target.kind === 'police' ? 36 : 26,
+      target.kind === 'police' ? 'GRAND THEFT CRUISER!' : 'VEHICLE HIJACKED!',
+    );
   }
 
   public triggerNitro(): void {
@@ -1141,11 +1234,21 @@ export class CryptidGame3DEngine {
     soundEngine.playWreckExplosion(this.combo);
 
     this.pushCallout(
-      `WRECKED! +${earned}`,
-      this.combo >= 2 ? `${this.combo}× PANIC COMBO` : 'DRIVER LOST CONTROL!',
-      '#FF5412',
+      v.isPolice ? `COP WRECKED! +${earned}` : `WRECKED! +${earned}`,
+      this.combo >= 2
+        ? `${this.combo}× PANIC COMBO`
+        : v.isPolice
+          ? 'INTERCEPTOR SMASHED!'
+          : 'DRIVER LOST CONTROL!',
+      v.isPolice ? '#3B82F6' : '#FF5412',
       54,
       46,
+    );
+
+    // Wrecking vehicles raises Wanted Heat & brings Police Interceptors after you!
+    this.addWantedHeat(
+      v.isPolice ? 28 : 18,
+      v.isPolice ? 'OFFICER DOWN — BACKUP CALLED!' : 'HIGHWAY WRECK!',
     );
   }
 
@@ -1190,6 +1293,7 @@ export class CryptidGame3DEngine {
       );
       this.setToast(`RESCUED ${truck.rider.name} (${truck.rider.poolNumber})! Permanently unlocked!`, 4.5);
       this.callbacks.onMonsterRescued(rescuedId);
+      this.addWantedHeat(32, 'PRISON BREAK — ALL UNITS!');
     } else {
       const lockBonus = Math.round(25 * this.stats.dreadMultiplier);
       this.dreadThisRun += lockBonus;
@@ -1208,13 +1312,14 @@ export class CryptidGame3DEngine {
     // Keep at least 2 lanes clear in any 15m longitudinal band so the player can always weave cleanly
     let bandCount = 0;
     for (const other of this.vehicles) {
-      if (other.active && !other.wrecking && Math.abs(other.z - zStart) < 15) {
+      if (other.active && !other.wrecking && Math.abs(other.z - zStart) < 22) {
         bandCount++;
       }
     }
+    // Keep at most 2 vehicles in any 22m slice so open weaving lanes always exist
     if (bandCount >= 2) return false;
 
-    // Shuffle all 4 highway lanes and pick the first one with safe longitudinal clearance
+    // Shuffle all 4 highway lanes and pick the first one with safe longitudinal & side clearance
     const laneOrder = [0, 1, 2, 3];
     for (let i = laneOrder.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -1227,15 +1332,24 @@ export class CryptidGame3DEngine {
     for (const li of laneOrder) {
       const lx = LANE_XS[li];
       let blocked = false;
-      for (const other of this.vehicles) {
-        if (
-          other.active &&
-          !other.wrecking &&
-          Math.abs(other.x - lx) < 2.6 &&
-          Math.abs(other.z - zStart) < 20
-        ) {
-          blocked = true;
-          break;
+      // Leave generous clearance around the wide captive containment truck
+      if (
+        this.captiveTruck &&
+        Math.abs(this.captiveTruck.z - zStart) < 26 &&
+        Math.abs(this.captiveTruck.x - lx) < 4.2
+      ) {
+        blocked = true;
+      }
+      if (!blocked) {
+        for (const other of this.vehicles) {
+          if (!other.active || other.wrecking) continue;
+          const dx = Math.abs(other.x - lx);
+          const dz = Math.abs(other.z - zStart);
+          // Same-lane clearance (30m) + prevent tight side-by-side walls in adjacent lanes (14m)
+          if ((dx < 2.6 && dz < 30) || (dx < 5.6 && dz < 14)) {
+            blocked = true;
+            break;
+          }
         }
       }
       if (!blocked) {
@@ -1307,6 +1421,105 @@ export class CryptidGame3DEngine {
     return true;
   }
 
+  private addWantedHeat(amount: number, reason: string): void {
+    this.wantedHeat = Math.min(195, this.wantedHeat + amount);
+    this.wantedCoolTimer = 22;
+
+    let newStars = 0;
+    for (let s = 1; s <= 5; s++) {
+      if (this.wantedHeat >= WANTED_THRESHOLDS[s]) newStars = s;
+    }
+
+    if (newStars > this.wantedStars) {
+      this.wantedStars = newStars;
+      // Dispatch police immediately when a new wanted star lights up!
+      this.policeSpawnTimer = Math.min(this.policeSpawnTimer, 0.65);
+      soundEngine.playPoliceSirenBurst();
+
+      const starStr = '★'.repeat(newStars) + '☆'.repeat(5 - newStars);
+      const sub =
+        newStars >= 5
+          ? 'MAX HEAT · CRYPTID MANHUNT!'
+          : newStars >= 3
+            ? `${reason} · INTERCEPTOR SQUAD INBOUND!`
+            : `${reason} · POLICE CHASING!`;
+
+      this.pushCallout(`${starStr} WANTED`, sub, '#FF2A54', 50, 32);
+      this.setToast(`WANTED LEVEL ${newStars}: Police Interceptors are pursuing you!`, 3.2);
+      this.hudThrottle = 0.065;
+    }
+  }
+
+  private spawnPoliceCruiser(): boolean {
+    // Alternate between roaring up from behind (+Z) and intercepting from ahead (-Z)
+    const fromBehind = this.nextVehicleId % 2 === 0;
+    const zStart = fromBehind ? 19 : -62;
+
+    // Pick a lane clear of other cars and close to player's flank
+    let chosenLane = 0;
+    let bestScore = Infinity;
+    for (let li = 0; li < LANE_XS.length; li++) {
+      const lx = LANE_XS[li];
+      let blocked = false;
+      for (const other of this.vehicles) {
+        if (!other.active || other.wrecking) continue;
+        if (Math.abs(other.x - lx) < 2.6 && Math.abs(other.z - zStart) < 18) {
+          blocked = true;
+          break;
+        }
+      }
+      if (blocked) continue;
+      // Prefer a neighboring lane rather than spawning dead-center on top of the player
+      const distToPlayer = Math.abs(lx - this.playerX);
+      const score = Math.abs(distToPlayer - 3.2);
+      if (score < bestScore) {
+        bestScore = score;
+        chosenLane = li;
+      }
+    }
+
+    const x = LANE_XS[chosenLane];
+    const built = buildHumanVehicleMesh('police', 0x0f172a);
+    built.group.position.set(x, 0, zStart);
+    this.trafficRoot.add(built.group);
+
+    const flankSide = x >= this.playerX ? 1 : -1;
+    const initSpeed = fromBehind
+      ? this.playerSpeed + 14 + this.wantedStars * 2
+      : Math.max(18, this.playerSpeed - 10);
+
+    this.vehicles.push({
+      id: this.nextVehicleId++,
+      kind: 'police',
+      group: built.group,
+      panicBarBg: built.panicBarBg,
+      panicBarFill: built.panicBarFill,
+      hijackRing: built.hijackRing,
+      policeStrobeL: built.policeStrobeL,
+      policeStrobeR: built.policeStrobeR,
+      policeGlowPool: built.policeGlowPool,
+      laneIndex: chosenLane,
+      x,
+      z: zStart,
+      speed: initSpeed,
+      panic: 0,
+      shieldActive: false,
+      wrecking: false,
+      wreckTimer: 0,
+      spinVel: 0,
+      driftVx: 0,
+      baseDread: 165,
+      active: true,
+      isPolice: true,
+      pursuitTimer: 0,
+      flankSide,
+      ramTimer: Math.max(1.8, 3.6 - this.wantedStars * 0.35),
+    });
+
+    soundEngine.playPoliceSirenBurst();
+    return true;
+  }
+
   private spawnCaptiveTruck(): void {
     // Pick a locked coloring-book monster not yet unlocked or rescued this run!
     const locked = RIDERS.filter(
@@ -1346,16 +1559,20 @@ export class CryptidGame3DEngine {
         ? this.stats.footDamageMult
         : this.controlMode === 'stolen_van'
           ? 0.55
-          : bike.armorScale;
+          : this.controlMode === 'stolen_police'
+            ? 0.68
+            : bike.armorScale;
 
     const dmg = Math.max(1, Math.round(baseAmount * modeMult));
     this.hp = Math.max(0, this.hp - dmg);
-    this.invulnTimer = 1.25;
+    this.invulnTimer = 0.95;
+    this.damageFlash = 1.0;
     this.combo = 0;
     this.comboTimer = 0;
-    this.shakeIntensity = 0.78;
+    this.shakeIntensity = 0.85;
     this.hitstopTimer = 0.055;
     soundEngine.playHit(this.controlMode === 'on_foot');
+    this.spawnShockwave(new THREE.Vector3(this.playerX, 0.95, 0), 3.6, '#FF2A54', false, 0.34);
 
     this.pushCallout(
       `-${dmg} INTEGRITY`,
@@ -1367,6 +1584,8 @@ export class CryptidGame3DEngine {
 
     if (this.hp <= 0) {
       this.finishRun(true);
+    } else {
+      this.emitHud();
     }
   }
 
@@ -1403,6 +1622,9 @@ export class CryptidGame3DEngine {
     this.elapsed += dt;
 
     if (this.screen === 'PLAYING') {
+      if (this.damageFlash > 0) {
+        this.damageFlash = Math.max(0, this.damageFlash - dt * 2.8);
+      }
       if (this.hitstopTimer > 0) {
         this.hitstopTimer -= dt;
       } else {
@@ -1578,6 +1800,7 @@ export class CryptidGame3DEngine {
     if (this.wheelieTimer > 0) this.wheelieTimer -= dt;
     if (this.loomTimer > 0) this.loomTimer -= dt;
     if (this.leapAnimTimer > 0) this.leapAnimTimer = Math.max(0, this.leapAnimTimer - dt);
+    if (this.hijackThrowTimer > 0) this.hijackThrowTimer = Math.max(0, this.hijackThrowTimer - dt);
     if (this.darknessTimer > 0) this.darknessTimer = Math.max(0, this.darknessTimer - dt);
     if (this.statusToastTimer > 0) {
       this.statusToastTimer -= dt;
@@ -1594,6 +1817,9 @@ export class CryptidGame3DEngine {
     }
     if (this.signatureCooldown > 0) {
       this.signatureCooldown = Math.max(0, this.signatureCooldown - dt);
+    }
+    if (this.hijackCooldown > 0) {
+      this.hijackCooldown = Math.max(0, this.hijackCooldown - dt);
     }
     if (this.nitroActive) {
       this.nitroTimer -= dt;
@@ -1633,6 +1859,9 @@ export class CryptidGame3DEngine {
     } else if (this.controlMode === 'stolen_muscle') {
       modeTop = this.stats.topSpeed * 1.15;
       modeSteer = 15.5;
+    } else if (this.controlMode === 'stolen_police') {
+      modeTop = this.stats.topSpeed * 1.18;
+      modeSteer = 16.0;
     } else if (this.controlMode === 'stolen_van') {
       modeTop = this.stats.topSpeed * 0.94;
       modeSteer = 11.5;
@@ -1672,14 +1901,18 @@ export class CryptidGame3DEngine {
     const mph = Math.round(this.playerSpeed * 2.15);
     if (mph > this.maxMph) this.maxMph = mph;
 
-    // Animate player rig (leap arc, bike lean into corners, wheelie, on-foot sprint!)
+    // Animate player rig (leap arc, bike lean into corners, wheelie, monster heave throw, on-foot sprint!)
     const leapY = this.leapAnimTimer > 0 ? Math.sin((this.leapAnimTimer / 0.45) * Math.PI) * 2.5 : 0;
+    const throwWhip =
+      this.hijackThrowTimer > 0
+        ? Math.sin((this.hijackThrowTimer / 0.52) * Math.PI * 1.35) * this.hijackThrowSide
+        : 0;
     const targetLean = steer * 0.22;
     this.bikeLean = THREE.MathUtils.damp(this.bikeLean, targetLean, 10, dt);
 
     if (this.controlMode === 'own_bike' || this.controlMode === 'stolen_bike') {
       this.bikeRig.root.position.set(this.playerX, leapY, 0);
-      this.bikeRig.bodyGroup.rotation.z = this.bikeLean;
+      this.bikeRig.bodyGroup.rotation.z = this.bikeLean - throwWhip * 0.24;
       const wPitch = this.wheelieTimer > 0 ? -0.34 : 0;
       this.bikeRig.bodyGroup.rotation.x = THREE.MathUtils.damp(
         this.bikeRig.bodyGroup.rotation.x,
@@ -1721,8 +1954,28 @@ export class CryptidGame3DEngine {
       );
     } else if (this.stolenVehicleGroup) {
       this.stolenVehicleGroup.position.set(this.playerX, leapY, 0);
-      this.stolenVehicleGroup.rotation.z = this.bikeLean * 0.28;
+      this.stolenVehicleGroup.rotation.z = this.bikeLean * 0.28 - throwWhip * 0.09;
       this.stolenVehicleGroup.rotation.y = 0;
+      // Monster visibly lunges & whips sideways while slinging the driver out of the cab!
+      if (this.hijackBustRig) {
+        this.hijackBustRig.root.rotation.z = -throwWhip * 0.42;
+        this.hijackBustRig.root.position.x = throwWhip * 0.34;
+      }
+      // Keep the stolen Police Interceptor's red/blue lightbars strobing!
+      if (this.stolenPoliceStrobes) {
+        const flashRed = Math.floor(this.elapsed * 9.5) % 2 === 0;
+        if (this.stolenPoliceStrobes.l) {
+          (this.stolenPoliceStrobes.l.material as THREE.MeshBasicMaterial).opacity = flashRed ? 0.95 : 0.14;
+        }
+        if (this.stolenPoliceStrobes.r) {
+          (this.stolenPoliceStrobes.r.material as THREE.MeshBasicMaterial).opacity = flashRed ? 0.14 : 0.95;
+        }
+        if (this.stolenPoliceStrobes.pool) {
+          (this.stolenPoliceStrobes.pool.material as THREE.MeshBasicMaterial).color.setHex(
+            flashRed ? 0xff1e42 : 0x2563eb,
+          );
+        }
+      }
     }
 
     // Cosmetic Out of Lines Neon Trail
@@ -1774,23 +2027,74 @@ export class CryptidGame3DEngine {
     }
 
     const inOpening = this.runElapsed < 30;
-    const maxTraffic = inOpening ? 20 : 18;
-    const minAheadVisible = inOpening ? 4 : 3;
+    const maxTraffic = inOpening ? 12 : 11;
+    const minAheadVisible = inOpening ? 3 : 2;
 
-    // Keep the highway steadily populated with civilian targets ahead to scare & weave around
+    // Keep the highway steadily populated with civilian targets ahead, spaced for clean weaving
     this.vehicleSpawnTimer -= dt;
     if (this.vehicles.length < maxTraffic && (this.vehicleSpawnTimer <= 0 || aheadVisibleCount < minAheadVisible)) {
       const zSpawn =
         aheadVisibleCount < minAheadVisible
-          ? -74 - Math.random() * 28
-          : -105 - Math.random() * 34;
+          ? -82 - Math.random() * 28
+          : -112 - Math.random() * 34;
       const spawned = this.spawnHumanVehicle(zSpawn, inOpening && Math.random() < 0.65);
       if (spawned) {
         this.vehicleSpawnTimer = inOpening
-          ? 0.42 + Math.random() * 0.28
-          : 0.52 + Math.random() * 0.34;
+          ? 0.78 + Math.random() * 0.42
+          : 0.92 + Math.random() * 0.48;
       } else {
-        this.vehicleSpawnTimer = 0.16;
+        this.vehicleSpawnTimer = 0.24;
+      }
+    }
+
+    // Count active pursuing police cruisers & handle Police Interceptor dispatching
+    let activePoliceCount = 0;
+    let closestPoliceDist = Infinity;
+    for (const v of this.vehicles) {
+      if (v.active && !v.wrecking && v.isPolice) {
+        activePoliceCount++;
+        const pd = Math.hypot(v.x - this.playerX, v.z);
+        if (pd < closestPoliceDist) closestPoliceDist = pd;
+      }
+    }
+    this.policeChasingCount = activePoliceCount;
+
+    const targetPolice =
+      this.wantedStars <= 0
+        ? 0
+        : this.wantedStars === 1
+          ? 1
+          : this.wantedStars <= 3
+            ? 2
+            : this.wantedStars === 4
+              ? 3
+              : 4;
+
+    if (this.wantedStars >= 1 && activePoliceCount < targetPolice) {
+      this.policeSpawnTimer -= dt;
+      if (this.policeSpawnTimer <= 0) {
+        if (this.spawnPoliceCruiser()) {
+          this.policeSpawnTimer = Math.max(1.4, 4.0 - this.wantedStars * 0.5);
+        } else {
+          this.policeSpawnTimer = 0.5;
+        }
+      }
+    }
+
+    // Slow heat cooldown only when no crimes committed recently & no cops close
+    if (this.wantedCoolTimer > 0) {
+      this.wantedCoolTimer -= dt;
+    } else if (this.wantedHeat > 0 && closestPoliceDist > 34) {
+      this.wantedHeat = Math.max(0, this.wantedHeat - dt * 3.5);
+      let sNow = 0;
+      for (let s = 1; s <= 5; s++) {
+        if (this.wantedHeat >= WANTED_THRESHOLDS[s]) sNow = s;
+      }
+      if (sNow < this.wantedStars) {
+        this.wantedStars = sNow;
+        if (sNow === 0) {
+          this.pushCallout('HEAT EVADED!', 'POLICE LOST YOUR TRAIL', '#8CFF2E', 50, 36);
+        }
       }
     }
 
@@ -1806,6 +2110,7 @@ export class CryptidGame3DEngine {
     let bestHijack: HighwayVehicle | null = null;
     let bestHijackDist = Infinity;
     let exposedToSpotlight = false;
+    const sirenSources: SpatialSirenSource[] = [];
 
     for (let i = this.vehicles.length - 1; i >= 0; i--) {
       const v = this.vehicles[i];
@@ -1828,11 +2133,94 @@ export class CryptidGame3DEngine {
         continue;
       }
 
+      // Active Police Interceptor Pursuit AI vs. Passive Civilian Traffic
+      let policeLatVel = 0;
+      if (v.isPolice) {
+        v.pursuitTimer = (v.pursuitTimer ?? 0) + dt;
+        v.ramTimer = (v.ramTimer ?? 2.6) - dt;
+
+        const isRamming =
+          (v.ramTimer ?? 1) <= 0 &&
+          (v.ramTimer ?? 1) > -1.15 &&
+          Math.abs(v.z) < 14;
+        if ((v.ramTimer ?? 1) <= -1.15) {
+          v.ramTimer = Math.max(1.6, 3.6 - this.wantedStars * 0.4) + Math.random() * 0.8;
+        }
+
+        // Pull right alongside z=0 when executing a PIT-ram; otherwise flank close in combat!
+        const baseSlotZ = -2.0 - (v.id % 3) * 3.5;
+        const slotZ = isRamming ? -0.4 : baseSlotZ;
+        let desiredSpeed = this.playerSpeed;
+        if (v.z > slotZ + 1.4) {
+          // Surge forward faster than player to pull up alongside!
+          desiredSpeed = this.playerSpeed + 13 + this.wantedStars * 2.4;
+        } else if (v.z < slotZ - 2.0) {
+          // Drop back onto player's quarter-panel to slam in
+          desiredSpeed = Math.max(14, this.playerSpeed - (isRamming ? 14 : 10));
+        } else {
+          desiredSpeed = this.playerSpeed + Math.sin(this.elapsed * 2.2 + v.id) * 2.0;
+        }
+        v.speed = THREE.MathUtils.damp(v.speed, desiredSpeed, isRamming ? 6.0 : 4.2, dt);
+
+        // Lateral flanking + periodic PIT-maneuver ram attempt!
+        let flankSide = v.flankSide ?? 1;
+        if (this.playerX + flankSide * 3.1 > ROAD_HALF_WIDTH - 1.3) flankSide = -1;
+        if (this.playerX + flankSide * 3.1 < -ROAD_HALF_WIDTH + 1.3) flankSide = 1;
+        v.flankSide = flankSide;
+
+        const targetX = isRamming
+          ? this.playerX
+          : THREE.MathUtils.clamp(
+              this.playerX + flankSide * 3.05,
+              -ROAD_HALF_WIDTH + 1.25,
+              ROAD_HALF_WIDTH - 1.25,
+            );
+        const lateralSpeed = isRamming ? 8.6 + this.wantedStars * 0.8 : 5.4;
+        const steerStep = THREE.MathUtils.clamp((targetX - v.x) * 3.0, -lateralSpeed, lateralSpeed);
+        policeLatVel = steerStep + v.driftVx;
+        v.x = THREE.MathUtils.clamp(
+          v.x + policeLatVel * dt,
+          -ROAD_HALF_WIDTH + 1.15,
+          ROAD_HALF_WIDTH - 1.15,
+        );
+        v.driftVx = THREE.MathUtils.damp(v.driftVx, 0, 3.8, dt);
+
+        // Flash Red & Blue Roof Strobes + wet highway glow pool!
+        const flashRed = Math.floor(this.elapsed * 10 + v.id) % 2 === 0;
+        if (v.policeStrobeL) {
+          (v.policeStrobeL.material as THREE.MeshBasicMaterial).opacity = flashRed ? 0.96 : 0.14;
+          v.policeStrobeL.scale.setScalar(flashRed ? 1.18 : 0.85);
+        }
+        if (v.policeStrobeR) {
+          (v.policeStrobeR.material as THREE.MeshBasicMaterial).opacity = flashRed ? 0.14 : 0.96;
+          v.policeStrobeR.scale.setScalar(flashRed ? 0.85 : 1.18);
+        }
+        if (v.policeGlowPool) {
+          const pm = v.policeGlowPool.material as THREE.MeshBasicMaterial;
+          pm.color.setHex(flashRed ? 0xff1e42 : 0x2563eb);
+          pm.opacity = isRamming ? 0.42 : 0.28;
+        }
+      } else {
+        v.x = THREE.MathUtils.clamp(v.x + v.driftVx * dt, -ROAD_HALF_WIDTH + 1.1, ROAD_HALF_WIDTH - 1.1);
+        v.driftVx = THREE.MathUtils.damp(v.driftVx, 0, 3.5, dt);
+      }
+
       // Relative movement along highway (positive z moves behind player)
+      const prevZ = v.z;
       const relSpeed = this.playerSpeed - v.speed;
       v.z += relSpeed * dt;
-      v.x = THREE.MathUtils.clamp(v.x + v.driftVx * dt, -ROAD_HALF_WIDTH + 1.1, ROAD_HALF_WIDTH - 1.1);
-      v.driftVx = THREE.MathUtils.damp(v.driftVx, 0, 3.5, dt);
+
+      // Feed 3D position & relative velocity of every active Police Cruiser into Doppler spatial audio
+      if (v.isPolice) {
+        sirenSources.push({
+          id: v.id,
+          x: v.x,
+          y: 2.05,
+          z: v.z,
+          vx: policeLatVel - this.playerVx,
+          vz: relSpeed,
+        });
+      }
 
       // Subtle panicked swerving when Panic > 30%
       if (v.panic > 30) {
@@ -1851,12 +2239,12 @@ export class CryptidGame3DEngine {
         v.panicBarFill.position.x = -(1 - frac) * 1.04;
       }
 
-      // Check hijack proximity (~25m ahead through ~9m passing alongside)
+      // Check hijack proximity (~25m ahead through ~9m passing alongside) when hijack is off cooldown
       const dx = Math.abs(v.x - this.playerX);
       const dz = Math.abs(v.z);
       const dist = Math.hypot(dx, dz);
       v.hijackRing.visible = false;
-      if (this.isVehicleHijackable(v) && dist < bestHijackDist) {
+      if (this.hijackCooldown <= 0 && this.isVehicleHijackable(v) && dist < bestHijackDist) {
         bestHijackDist = dist;
         bestHijack = v;
       }
@@ -1866,26 +2254,84 @@ export class CryptidGame3DEngine {
         exposedToSpotlight = true;
       }
 
-      // Collision check with player
-      const hitW = v.kind === 'bike' ? 1.15 : 1.75;
-      const hitL = v.kind === 'bike' ? 1.9 : 3.2;
-      if (dx < hitW && dz < hitL && this.leapAnimTimer <= 0.05) {
-        if ((this.nitroActive || this.controlMode === 'stolen_van') && this.controlMode !== 'on_foot') {
-          // Smash straight through into an instant wreck!
+      // Collision check with player (combined player + vehicle widths & swept Z so fast passes never tunnel)
+      const playerHalfW =
+        this.controlMode === 'on_foot'
+          ? 0.55
+          : this.controlMode === 'own_bike' || this.controlMode === 'stolen_bike'
+            ? 0.65
+            : this.controlMode === 'stolen_van'
+              ? 1.45
+              : 1.3;
+      const vehHalfW =
+        v.kind === 'bike'
+          ? 0.85
+          : v.kind === 'sedan'
+            ? 1.45
+            : v.kind === 'muscle'
+              ? 1.55
+              : v.kind === 'police'
+                ? 1.6
+                : 1.75;
+      const hitW = playerHalfW + vehHalfW;
+      const hitL = v.kind === 'bike' ? 2.2 : v.kind === 'van' ? 3.8 : 3.5;
+      const zOverlap = Math.max(prevZ, v.z) >= -hitL && Math.min(prevZ, v.z) <= hitL;
+      if (dx < hitW && zOverlap && this.leapAnimTimer <= 0.05) {
+        if (this.nitroActive && this.controlMode !== 'on_foot' && !v.isPolice) {
+          // Active Nitro boost plows straight through civilian vehicles into a wreck!
           this.wreckVehicle(v, 1.25);
         } else {
-          this.takeDamage(1, v.kind === 'bike' ? 'BIKER CLIP' : 'HIGHWAY BUMPER');
-          v.driftVx = v.x >= this.playerX ? 7 : -7;
-          this.playerVx = v.x >= this.playerX ? -8 : 8;
+          this.takeDamage(
+            1,
+            v.isPolice
+              ? 'POLICE PIT RAM'
+              : v.kind === 'bike'
+                ? 'BIKER CLIP'
+                : 'HIGHWAY CRASH',
+          );
+          const pushDir = v.x >= this.playerX ? 1 : -1;
+          v.driftVx = pushDir * 9.5;
+          this.playerVx = -pushDir * 9.5;
+          if (relSpeed > 4) {
+            this.playerSpeed = Math.max(12, this.playerSpeed * 0.86);
+          }
+          if (v.isPolice) {
+            v.ramTimer = Math.max(1.8, 3.6 - this.wantedStars * 0.4);
+          }
         }
       }
 
-      // Despawn cleanly once behind camera or far beyond horizon
-      if (v.z > 22 || v.z < -195) {
+      // Despawn cleanly once behind camera or far beyond horizon (give pursuing cops extra rear margin!)
+      const rearDespawnZ = v.isPolice ? 34 : 22;
+      if (v.z > rearDespawnZ || v.z < -195) {
         this.trafficRoot.remove(v.group);
         this.vehicles.splice(i, 1);
       }
     }
+
+    // Distant incoming patrol wail while Wanted Stars are active & cruisers are inbound
+    if (this.wantedStars >= 1 && sirenSources.length === 0) {
+      sirenSources.push({
+        id: -1,
+        x: this.playerX > 0 ? -4.2 : 4.2,
+        y: 2.05,
+        z: -54,
+        vx: 0,
+        vz: 16,
+      });
+    }
+    if (this.controlMode === 'stolen_police') {
+      sirenSources.push({
+        id: -99,
+        x: this.playerX,
+        y: 2.05,
+        z: 0,
+        vx: 0,
+        vz: 0,
+        isPlayerOwned: true,
+      });
+    }
+    soundEngine.updateSpatialPoliceSirens(sirenSources, this.wantedStars);
 
     this.hijackTarget = bestHijack;
     if (bestHijack) {
@@ -1922,6 +2368,7 @@ export class CryptidGame3DEngine {
         truck.captiveSilhouette.rotation.y += dt * 8;
       }
 
+      const prevTruckZ = truck.z;
       truck.z += (this.playerSpeed - truckSpeed) * dt;
       truck.group.position.set(truck.x, 0, truck.z);
 
@@ -1939,9 +2386,23 @@ export class CryptidGame3DEngine {
       truck.hijackRing.visible = nearTruck;
       if (nearTruck) truck.hijackRing.rotation.z += dt * 3;
 
-      // Solid bumper collision with truck body (avoid getting stuck inside)
-      if (!truck.freed && Math.abs(truck.x - this.playerX) < 2.2 && Math.abs(truck.z) < 4.8 && this.leapAnimTimer <= 0.05) {
-        this.playerX += this.playerX >= truck.x ? 1.5 : -1.5;
+      // Solid bumper collision with armored prison truck body (matches 7.6m wide truck sprite)
+      const truckPlayerHalfW =
+        this.controlMode === 'on_foot'
+          ? 0.55
+          : this.controlMode === 'own_bike' || this.controlMode === 'stolen_bike'
+            ? 0.65
+            : 1.35;
+      const truckHitW = truckPlayerHalfW + 2.8;
+      const truckZOverlap = Math.max(prevTruckZ, truck.z) >= -5.0 && Math.min(prevTruckZ, truck.z) <= 5.0;
+      if (!truck.freed && Math.abs(truck.x - this.playerX) < truckHitW && truckZOverlap && this.leapAnimTimer <= 0.05) {
+        const pushDir = this.playerX >= truck.x ? 1 : -1;
+        this.playerX = THREE.MathUtils.clamp(
+          this.playerX + pushDir * 1.65,
+          -ROAD_HALF_WIDTH + 0.85,
+          ROAD_HALF_WIDTH - 0.85,
+        );
+        this.playerVx = pushDir * 9.0;
         this.takeDamage(1, 'ARMORED TRUCK');
       }
 
@@ -2038,15 +2499,469 @@ export class CryptidGame3DEngine {
         sp.mesh.visible = false;
       }
     }
+
+    this.stepThrownDrivers(dt);
+  }
+
+  private getDriverFaceTexture(): THREE.CanvasTexture {
+    if (this.driverFaceTex) return this.driverFaceTex;
+    const c = document.createElement('canvas');
+    c.width = 128;
+    c.height = 128;
+    const g = c.getContext('2d');
+    if (g) {
+      g.fillStyle = '#f6cfa9';
+      g.fillRect(0, 0, 128, 128);
+      // Terrified raised eyebrows
+      g.strokeStyle = '#18141c';
+      g.lineWidth = 6;
+      g.beginPath();
+      g.moveTo(22, 30);
+      g.lineTo(50, 22);
+      g.moveTo(78, 22);
+      g.lineTo(106, 30);
+      g.stroke();
+      // Wide cartoon eyes
+      g.fillStyle = '#ffffff';
+      g.beginPath();
+      g.ellipse(38, 52, 16, 19, 0, 0, Math.PI * 2);
+      g.ellipse(90, 52, 16, 19, 0, 0, Math.PI * 2);
+      g.fill();
+      g.stroke();
+      // Tiny panicked pupils
+      g.fillStyle = '#111111';
+      g.beginPath();
+      g.arc(38, 52, 5, 0, Math.PI * 2);
+      g.arc(90, 52, 5, 0, Math.PI * 2);
+      g.fill();
+      // Screaming open "O" mouth
+      g.fillStyle = '#7f1d1d';
+      g.beginPath();
+      g.ellipse(64, 96, 19, 23, 0, 0, Math.PI * 2);
+      g.fill();
+      g.stroke();
+      // Top teeth glint
+      g.fillStyle = '#ffffff';
+      g.fillRect(52, 77, 24, 7);
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    this.driverFaceTex = tex;
+    return tex;
+  }
+
+  private getScreamTagTexture(label: string): THREE.CanvasTexture {
+    const existing = this.screamTagTextures.get(label);
+    if (existing) return existing;
+    const c = document.createElement('canvas');
+    c.width = 256;
+    c.height = 96;
+    const g = c.getContext('2d');
+    if (g) {
+      g.clearRect(0, 0, 256, 96);
+      // Jagged comic-ink speech card
+      g.fillStyle = '#ffd166';
+      g.strokeStyle = '#0b0e18';
+      g.lineWidth = 8;
+      g.fillRect(10, 12, 236, 62);
+      g.strokeRect(10, 12, 236, 62);
+      // Speech tail
+      g.beginPath();
+      g.moveTo(116, 74);
+      g.lineTo(128, 92);
+      g.lineTo(144, 74);
+      g.closePath();
+      g.fill();
+      g.stroke();
+      // Comic shout text
+      g.fillStyle = '#0b0e18';
+      g.font = '900 38px "Big Shoulders Display", Impact, sans-serif';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.fillText(label, 128, 45);
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    this.screamTagTextures.set(label, tex);
+    return tex;
+  }
+
+  private spawnThrownDriver(vehicleKind: HumanVehicleKind): void {
+    const rider = getRider(this.save.equipped.rider);
+    const startY = vehicleKind === 'van' ? 2.45 : vehicleKind === 'bike' ? 1.85 : 1.95;
+
+    // Aim toward the nearest live traffic car ahead (or across the middle lanes into traffic!)
+    let targetCar: HighwayVehicle | null = null;
+    let bestScore = Infinity;
+    for (const v of this.vehicles) {
+      if (!v.active || v.wrecking) continue;
+      if (v.z < -6 && v.z > -46) {
+        const score = Math.abs(v.z) + Math.abs(v.x - this.playerX) * 0.7;
+        if (score < bestScore) {
+          bestScore = score;
+          targetCar = v;
+        }
+      }
+    }
+
+    let throwSide: number;
+    if (targetCar) {
+      const dx = targetCar.x - this.playerX;
+      throwSide = Math.abs(dx) > 0.6 ? Math.sign(dx) : this.playerX > 0 ? -1 : 1;
+    } else {
+      throwSide = this.playerX > 0 ? -1 : 1;
+    }
+
+    this.hijackThrowSide = throwSide;
+    this.hijackThrowTimer = 0.52;
+
+    // Pick driver wardrobe matching the hijacked vehicle
+    const jacketColor =
+      vehicleKind === 'police'
+        ? 0x1d4ed8
+        : vehicleKind === 'van'
+          ? 0xfacc15
+          : vehicleKind === 'muscle'
+            ? 0xef4444
+            : vehicleKind === 'bike'
+              ? 0xf97316
+              : 0x38bdf8;
+    const pantsColor = vehicleKind === 'police' || vehicleKind === 'van' ? 0x0f172a : 0x1d4ed8;
+    const hairColor = vehicleKind === 'police' || vehicleKind === 'bike' ? 0x111827 : 0x451a03;
+
+    const root = new THREE.Group();
+    const body = new THREE.Group();
+    root.add(body);
+
+    const skinMat = new THREE.MeshStandardMaterial({ color: 0xf6cfa9, roughness: 0.65 });
+    const faceMat = new THREE.MeshBasicMaterial({ map: this.getDriverFaceTexture() });
+    const jacketMat = new THREE.MeshStandardMaterial({
+      color: jacketColor,
+      roughness: 0.45,
+      emissive: jacketColor,
+      emissiveIntensity: 0.14,
+    });
+    const pantsMat = new THREE.MeshStandardMaterial({ color: pantsColor, roughness: 0.7 });
+    const shoeMat = new THREE.MeshStandardMaterial({ color: 0x11131a, roughness: 0.5 });
+    const hairMat = new THREE.MeshStandardMaterial({ color: hairColor, roughness: 0.6 });
+
+    // Torso
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.76, 0.36), jacketMat);
+    body.add(torso);
+
+    // Head with terrified face on front AND back so camera always reads the panic!
+    const headMats = [skinMat, skinMat, hairMat, skinMat, faceMat, faceMat];
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.46, 0.46), headMats);
+    head.position.y = 0.64;
+    body.add(head);
+
+    // Articulated flailing arms
+    const makeLimb = (w: number, h: number, mat: THREE.Material, endMat: THREE.Material, yOff: number) => {
+      const pivot = new THREE.Group();
+      const seg = new THREE.Mesh(new THREE.BoxGeometry(w, h, w), mat);
+      seg.position.y = yOff;
+      pivot.add(seg);
+      const tip = new THREE.Mesh(new THREE.BoxGeometry(w * 1.05, w * 0.9, w * 1.05), endMat);
+      tip.position.y = yOff * 2;
+      pivot.add(tip);
+      return pivot;
+    };
+
+    const leftArm = makeLimb(0.2, 0.58, jacketMat, skinMat, -0.26);
+    leftArm.position.set(-0.42, 0.32, 0);
+    body.add(leftArm);
+
+    const rightArm = makeLimb(0.2, 0.58, jacketMat, skinMat, -0.26);
+    rightArm.position.set(0.42, 0.32, 0);
+    body.add(rightArm);
+
+    const leftLeg = makeLimb(0.23, 0.62, pantsMat, shoeMat, -0.29);
+    leftLeg.position.set(-0.18, -0.38, 0);
+    body.add(leftLeg);
+
+    const rightLeg = makeLimb(0.23, 0.62, pantsMat, shoeMat, -0.29);
+    rightLeg.position.set(0.18, -0.38, 0);
+    body.add(rightLeg);
+
+    // Scale driver slightly heroic (1.2x) so they read super clearly flying down the highway
+    body.scale.setScalar(1.2);
+
+    // Comic shout tag ("AAAHH!", "MY CAR!", "STOP! POLICE!")
+    const shouts =
+      vehicleKind === 'police'
+        ? ['BACKUP!!', 'STOP!!', 'MY CRUISER!']
+        : vehicleKind === 'van'
+          ? ['MY VAN!!', 'AAAHH!!', 'MONSTER!!']
+          : vehicleKind === 'bike'
+            ? ['MY BIKE!!', 'WHOA!!', 'AAAHH!!']
+            : ['MY CAR!!', 'AAAHH!!', 'WHOA!!'];
+    const screamLabel = shouts[Math.floor(Math.random() * shouts.length)];
+    const screamMat = new THREE.SpriteMaterial({
+      map: this.getScreamTagTexture(screamLabel),
+      transparent: true,
+      depthTest: false,
+    });
+    const screamSprite = new THREE.Sprite(screamMat);
+    screamSprite.scale.set(2.3, 0.88, 1);
+    screamSprite.position.set(0, 1.65, 0);
+    root.add(screamSprite);
+
+    // Chunky monster-colored grab arm + claws that visibly yanks & slings the driver out!
+    const grabArm = new THREE.Group();
+    const armMat = new THREE.MeshStandardMaterial({
+      color: rider.bodyColor,
+      emissive: rider.accentColor,
+      emissiveIntensity: 0.22,
+      roughness: 0.5,
+    });
+    const clawMat = new THREE.MeshStandardMaterial({
+      color: rider.accentColor,
+      emissive: rider.accentColor,
+      emissiveIntensity: 0.45,
+      roughness: 0.35,
+    });
+    const forearm = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.22, 1.0, 8), armMat);
+    forearm.rotation.x = Math.PI / 2;
+    forearm.position.z = 0.5;
+    grabArm.add(forearm);
+    for (let ci = -1; ci <= 1; ci++) {
+      const claw = new THREE.Mesh(new THREE.ConeGeometry(0.08, 0.32, 6), clawMat);
+      claw.rotation.x = Math.PI / 2;
+      claw.position.set(ci * 0.12, 0.04, 1.08);
+      grabArm.add(claw);
+    }
+
+    // Compute launch velocity that flings the driver cleanly FORWARD (-Z) into traffic!
+    let vx = throwSide * (5.6 + Math.random() * 2.4);
+    let vz = -(22 + Math.random() * 6);
+    const vy = 8.4 + Math.random() * 1.4;
+    if (targetCar) {
+      // Lead the target car (which moves closer to player at relSpeed = playerSpeed - targetCar.speed)
+      const flightT = 0.72;
+      const relSpeed = Math.max(4, this.playerSpeed - targetCar.speed);
+      const predictedZ = Math.min(-6, targetCar.z + relSpeed * flightT);
+      vx = THREE.MathUtils.clamp((targetCar.x - this.playerX) / flightT, -13, 13);
+      vz = THREE.MathUtils.clamp(predictedZ / flightT, -38, -14);
+    }
+
+    const startPos = new THREE.Vector3(this.playerX - throwSide * 0.4, startY, -0.15);
+    root.position.copy(startPos);
+    grabArm.position.set(this.playerX, startY - 0.15, -0.1);
+
+    this.scene.add(root);
+    this.scene.add(grabArm);
+
+    this.thrownDrivers.push({
+      group: root,
+      body,
+      leftArm,
+      rightArm,
+      leftLeg,
+      rightLeg,
+      screamSprite,
+      grabArm,
+      throwSide,
+      startY,
+      age: 0,
+      grabDuration: 0.24,
+      maxAge: 2.35,
+      released: false,
+      pos: startPos,
+      vel: new THREE.Vector3(vx, vy, vz),
+      rotVel: new THREE.Vector3(
+        -9.5 - Math.random() * 4,
+        throwSide * (8 + Math.random() * 5),
+        -throwSide * (11 + Math.random() * 5),
+      ),
+      bounces: 0,
+      hitVehicleIds: new Set<number>(),
+      sparkAccum: 0,
+    });
+  }
+
+  private stepThrownDrivers(dt: number): void {
+    for (let i = this.thrownDrivers.length - 1; i >= 0; i--) {
+      const td = this.thrownDrivers[i];
+      td.age += dt;
+
+      // Wildly flailing panic limbs the entire time!
+      const flail = Math.sin(td.age * 32);
+      const flail2 = Math.cos(td.age * 28);
+      td.leftArm.rotation.z = -2.3 + flail * 0.9;
+      td.rightArm.rotation.z = 2.3 - flail * 0.9;
+      td.leftArm.rotation.x = flail2 * 0.8;
+      td.rightArm.rotation.x = -flail2 * 0.8;
+      td.leftLeg.rotation.x = flail * 1.1;
+      td.rightLeg.rotation.x = -flail * 1.1;
+
+      if (td.age < td.grabDuration) {
+        // PHASE 1: Monster yanks driver UP out of the seat and swings them overhead!
+        const t = td.age / td.grabDuration;
+        const arc = Math.sin(t * Math.PI);
+        const swingX = THREE.MathUtils.lerp(-td.throwSide * 0.55, td.throwSide * 1.15, t);
+        const liftY = td.startY + 0.35 + arc * 1.15;
+        const fwdZ = -0.15 - t * 1.1;
+        td.pos.set(this.playerX + swingX, liftY, fwdZ);
+        td.group.position.copy(td.pos);
+        td.body.rotation.set(t * 0.5, 0, -td.throwSide * t * 1.2);
+
+        // Stretch monster grab-arm from the cab roof straight to the driver's collar!
+        const shoulderX = this.playerX + td.throwSide * 0.18;
+        const shoulderY = td.startY - 0.1;
+        const shoulderZ = -0.12;
+        td.grabArm.visible = true;
+        td.grabArm.position.set(shoulderX, shoulderY, shoulderZ);
+        td.grabArm.lookAt(td.pos);
+        const reach = Math.max(0.4, td.grabArm.position.distanceTo(td.pos));
+        td.grabArm.scale.set(1, 1, reach);
+      } else {
+        // PHASE 2: RELEASE — Hurl the driver soaring & tumbling forward into traffic!
+        if (!td.released) {
+          td.released = true;
+          soundEngine.playDriverThrow();
+          this.spawnSparkBurst(td.pos, '#FFD166', 10);
+        }
+
+        // Retract monster grab-arm swiftly after release
+        const sinceRelease = td.age - td.grabDuration;
+        if (sinceRelease < 0.15) {
+          const retract = 1 - sinceRelease / 0.15;
+          td.grabArm.scale.set(retract, retract, Math.max(0.1, retract * 1.2));
+          td.grabArm.position.set(this.playerX, td.startY - 0.1, -0.12);
+        } else {
+          td.grabArm.visible = false;
+        }
+
+        // Parabolic flight physics in highway chase frame
+        td.vel.y -= 21.5 * dt;
+        // Air drag gradually slows forward throw speed so driver eventually tumbles back through oncoming lanes
+        td.vel.z = THREE.MathUtils.damp(td.vel.z, this.playerSpeed * 0.42, 0.85, dt);
+
+        td.pos.x += td.vel.x * dt;
+        td.pos.y += td.vel.y * dt;
+        td.pos.z += td.vel.z * dt;
+
+        // Keep within road guardrails (ricochet off barriers!)
+        if (Math.abs(td.pos.x) > ROAD_HALF_WIDTH - 0.6) {
+          td.pos.x = Math.sign(td.pos.x) * (ROAD_HALF_WIDTH - 0.6);
+          td.vel.x = -td.vel.x * 0.65;
+          this.spawnSparkBurst(td.pos, '#FFD166', 6);
+        }
+
+        // Bounce off midnight asphalt
+        if (td.pos.y <= 0.48 && td.vel.y < 0) {
+          td.pos.y = 0.48;
+          if (td.bounces < 2) {
+            td.bounces++;
+            td.vel.y = Math.max(4.0, Math.abs(td.vel.y) * 0.54);
+            td.vel.x *= 0.82;
+            this.spawnSparkBurst(td.pos, '#FF7A29', 7);
+          } else {
+            td.vel.y = 0;
+            td.vel.x *= 0.9;
+          }
+        }
+
+        td.group.position.copy(td.pos);
+        td.body.rotation.x += td.rotVel.x * dt;
+        td.body.rotation.y += td.rotVel.y * dt;
+        td.body.rotation.z += td.rotVel.z * dt;
+
+        // Subtle flying spark trail while airborne
+        td.sparkAccum += dt;
+        if (td.sparkAccum >= 0.065 && td.pos.y > 0.7 && td.age < 1.3) {
+          td.sparkAccum = 0;
+          this.spawnSparkBurst(td.pos, '#FFD166', 1);
+        }
+
+        // Check if thrown driver smacks into any car in highway traffic!
+        for (const v of this.vehicles) {
+          if (!v.active || v.wrecking || td.hitVehicleIds.has(v.id)) continue;
+          if (
+            Math.abs(td.pos.x - v.x) < 2.25 &&
+            Math.abs(td.pos.z - v.z) < 3.1 &&
+            td.pos.y < 3.4
+          ) {
+            td.hitVehicleIds.add(v.id);
+            soundEngine.playDriverSmack();
+
+            // Pinball the driver high off the car's hood/windshield!
+            td.vel.y = 8.6;
+            td.vel.x = (td.pos.x >= v.x ? 1 : -1) * (6 + Math.random() * 4);
+            td.vel.z = Math.max(td.vel.z, 6);
+            td.rotVel.multiplyScalar(1.35);
+
+            // Startled traffic car takes massive panic, swerves, and awards bonus Dread!
+            v.driftVx += (v.x >= td.pos.x ? 1 : -1) * 7.5;
+            const comboMult = this.advanceCombo(1);
+            const bowlingBonus = Math.round(45 * this.stats.dreadMultiplier * comboMult);
+            this.dreadThisRun += bowlingBonus;
+            this.spawnSparkBurst(td.pos, '#FF5412', 14);
+            this.shakeIntensity = Math.max(this.shakeIntensity, 0.28);
+            this.addWantedHeat(12, 'RECKLESS DRIVER TOSS!');
+
+            if (v.shieldActive) {
+              v.shieldActive = false;
+              if (v.shieldRing) v.shieldRing.visible = false;
+              this.pushCallout(
+                `DRIVER SMASHED SHIELD! +${bowlingBonus}`,
+                'SKEPTIC VAN EXPOSED!',
+                '#FFD166',
+                50,
+                40,
+              );
+            } else {
+              v.panic += 65;
+              if (v.panic >= 100) {
+                this.wreckVehicle(v, 1.25);
+              } else {
+                this.pushCallout(
+                  `THROWN INTO TRAFFIC! +${bowlingBonus}`,
+                  'CAR SWERVING IN PANIC!',
+                  '#FFD166',
+                  50,
+                  40,
+                );
+              }
+            }
+            break;
+          }
+        }
+      }
+
+      // Fade comic shout tag smoothly
+      const shoutAlpha =
+        td.age < 1.15 ? 1 : Math.max(0, 1 - (td.age - 1.15) / 0.55);
+      (td.screamSprite.material as THREE.SpriteMaterial).opacity = shoutAlpha;
+      td.screamSprite.visible = shoutAlpha > 0.02;
+
+      // Shrink & clean up after flight finishes or tumbles past camera
+      if (td.age >= td.maxAge || td.pos.z > 14) {
+        this.scene.remove(td.group);
+        this.scene.remove(td.grabArm);
+        this.thrownDrivers.splice(i, 1);
+      }
+    }
   }
 
   private updateChaseCamera(dt: number): void {
     const isFoot = this.controlMode === 'on_foot';
-    const zBack = this.nitroActive ? 6.6 : isFoot ? 5.1 : 5.7;
-    const height = isFoot ? 2.05 : 2.25;
+    const isFourWheeler =
+      this.controlMode === 'stolen_sedan' ||
+      this.controlMode === 'stolen_muscle' ||
+      this.controlMode === 'stolen_police' ||
+      this.controlMode === 'stolen_van';
+    const zBack = this.nitroActive
+      ? 7.2
+      : isFoot
+        ? 5.4
+        : isFourWheeler
+          ? 6.8
+          : 6.2;
+    const height = isFoot ? 2.85 : isFourWheeler ? 3.55 : 3.15;
 
     _camGoal.set(this.playerX * 0.88, height, zBack);
-    _camLookGoal.set(this.playerX * 0.92, 1.85, -24);
+    _camLookGoal.set(this.playerX * 0.92, 1.45, -28);
 
     if (this.shakeIntensity > 0.01) {
       this.shakeIntensity = Math.max(0, this.shakeIntensity - dt * 2.5);
@@ -2062,6 +2977,20 @@ export class CryptidGame3DEngine {
     _camLookCurr.y = THREE.MathUtils.damp(_camLookCurr.y, _camLookGoal.y, 9, dt);
     _camLookCurr.z = THREE.MathUtils.damp(_camLookCurr.z, _camLookGoal.z, 9, dt);
     this.camera.lookAt(_camLookCurr);
+
+    // Sync Web Audio 3D AudioListener with the live chase camera for accurate HRTF spatialization
+    const fx = _camLookCurr.x - this.camera.position.x;
+    const fy = _camLookCurr.y - this.camera.position.y;
+    const fz = _camLookCurr.z - this.camera.position.z;
+    const fLen = Math.max(0.001, Math.hypot(fx, fy, fz));
+    soundEngine.updateSpatialListener(
+      this.camera.position.x,
+      this.camera.position.y,
+      this.camera.position.z,
+      fx / fLen,
+      fy / fLen,
+      fz / fLen,
+    );
 
     const targetFov = this.nitroActive ? 70 : isFoot ? 55 : 60;
     if (Math.abs(this.camera.fov - targetFov) > 0.1) {
@@ -2111,6 +3040,8 @@ export class CryptidGame3DEngine {
         return 'Stolen Sedan';
       case 'stolen_muscle':
         return 'Stolen Muscle Car';
+      case 'stolen_police':
+        return 'Stolen Police Cruiser';
       case 'stolen_van':
         return 'Stolen Skeptic Van';
       case 'stolen_bike':
@@ -2153,14 +3084,27 @@ export class CryptidGame3DEngine {
     }
 
     const hijackTargetLabel = this.hijackTarget
-      ? this.hijackTarget.kind === 'van'
-        ? 'Hijack Patrol Van'
-        : this.hijackTarget.kind === 'muscle'
-          ? 'Hijack Muscle Car'
-          : this.hijackTarget.kind === 'bike'
-            ? 'Hijack Bike'
-            : 'Hijack Sedan'
+      ? this.hijackTarget.kind === 'police'
+        ? 'Hijack Police Cruiser'
+        : this.hijackTarget.kind === 'van'
+          ? 'Hijack Patrol Van'
+          : this.hijackTarget.kind === 'muscle'
+            ? 'Hijack Muscle Car'
+            : this.hijackTarget.kind === 'bike'
+              ? 'Hijack Bike'
+              : 'Hijack Sedan'
       : null;
+
+    const prevThresh = WANTED_THRESHOLDS[this.wantedStars] ?? 0;
+    const nextThresh = WANTED_THRESHOLDS[Math.min(5, this.wantedStars + 1)] ?? 165;
+    const wantedHeatFrac =
+      this.wantedStars >= 5
+        ? 1
+        : THREE.MathUtils.clamp(
+            (this.wantedHeat - prevThresh) / Math.max(1, nextThresh - prevThresh),
+            0,
+            1,
+          );
 
     this.callbacks.onHudUpdate({
       dreadThisRun: this.dreadThisRun,
@@ -2175,12 +3119,19 @@ export class CryptidGame3DEngine {
         this.combo > 0 ? THREE.MathUtils.clamp(this.comboTimer / this.stats.comboWindow, 0, 1) : 0,
       hp: this.hp,
       maxHp: this.maxHp,
+      damageFlash: this.damageFlash,
       mph: Math.round(this.playerSpeed * 2.15),
       nitroFrac: this.nitroFrac,
       nitroActive: this.nitroActive,
       controlMode: this.controlMode,
       vehicleLabel: this.getVehicleLabel(),
       hijackTargetLabel,
+      hijackCooldownSec: this.hijackCooldown,
+      hijackCooldownFrac: THREE.MathUtils.clamp(
+        1 - this.hijackCooldown / HIJACK_COOLDOWN_SEC,
+        0,
+        1,
+      ),
       inDarkness: this.darknessTimer > 0,
       inSpotlightWarning: this.inSpotlightWarning,
       captiveTruck: captiveInfo,
@@ -2189,6 +3140,9 @@ export class CryptidGame3DEngine {
       signatureReadyFrac: THREE.MathUtils.clamp(1 - this.signatureCooldown / sigMax, 0, 1),
       signatureColor: rider.signatureColor,
       scareSlots,
+      wantedStars: this.wantedStars,
+      wantedHeatFrac,
+      policeChasingCount: this.policeChasingCount,
       statusToast: this.statusToast,
       callouts: this.callouts.length > 0 ? [{ ...this.callouts[0] }] : [],
     });
@@ -2293,6 +3247,15 @@ export class CryptidGame3DEngine {
     this.renderer.domElement.removeEventListener('pointerup', this.handleCanvasPointerUp);
     this.renderer.domElement.removeEventListener('pointercancel', this.handleCanvasPointerUp);
     this.renderer.domElement.removeEventListener('webglcontextlost', this.handleContextLost);
+
+    for (const td of this.thrownDrivers) {
+      this.scene.remove(td.group);
+      this.scene.remove(td.grabArm);
+    }
+    this.thrownDrivers = [];
+    this.driverFaceTex?.dispose();
+    for (const tex of this.screamTagTextures.values()) tex.dispose();
+    this.screamTagTextures.clear();
 
     for (const d of this.world.disposables) d.dispose();
     this.renderer.dispose();

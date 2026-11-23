@@ -399,8 +399,9 @@ export default function App() {
                   <Wrench className="w-4 h-4 text-[#ff7a29]" />
                   <span>Garage &amp; 51 Monsters</span>
                   {affordableCount > 0 && (
-                    <span className="font-mono text-xs font-bold bg-[#8cff2e] text-[#0b0e18] px-1.5 py-0.5">
-                      {affordableCount}
+                    <span className="font-mono text-[11px] font-bold bg-[#8cff2e] text-[#0b0e18] px-2 py-0.5">
+                      {affordableCount}{' '}
+                      {affordableCount === 1 ? 'Upgrade Ready' : 'Upgrades Ready'}
                     </span>
                   )}
                 </button>
@@ -655,10 +656,13 @@ export default function App() {
                 className="py-3 bg-[#1a2030] hover:bg-[#242c42] border-2 border-[#3a455e] hover:border-[#ff7a29] text-[#f4efe6] font-display text-xl font-bold tracking-wider uppercase flex items-center justify-center gap-2 cursor-pointer"
               >
                 <Wrench className="w-5 h-5 text-[#ff7a29]" />
-                <span>
-                  Open Garage
-                  {affordableCount > 0 ? ` (${affordableCount})` : ''}
-                </span>
+                <span>Open Garage</span>
+                {affordableCount > 0 && (
+                  <span className="font-mono text-[11px] font-bold bg-[#8cff2e] text-[#0b0e18] px-2 py-0.5">
+                    {affordableCount}{' '}
+                    {affordableCount === 1 ? 'Upgrade Ready' : 'Upgrades Ready'}
+                  </span>
+                )}
               </button>
 
               <button

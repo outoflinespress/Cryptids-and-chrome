@@ -21,6 +21,7 @@ import {
   Footprints,
   Bike,
   Car,
+  Star,
 } from 'lucide-react';
 import type { TouchControlId } from '../game/engine3d';
 import { HudSnapshot, ScareMechanicId } from '../game/types';
@@ -111,9 +112,14 @@ export function HudOverlay({
   const isOnFoot = hud.controlMode === 'on_foot';
   const isStolen = hud.controlMode.startsWith('stolen_');
 
+  const hijackCooling = hud.hijackCooldownSec > 0.05;
+  const hijackSecs = Math.ceil(hud.hijackCooldownSec);
+
   // Contextual [F] button label & accent
   let leapActionTitle = 'Leap On Foot';
-  let leapActionSub = 'Vulnerable · 2.2× Scare';
+  let leapActionSub = hijackCooling
+    ? `Hijack ready in ${hijackSecs}s`
+    : 'Vulnerable · 2.2× Scare';
   let leapAccent = '#f4efe6';
   let leapHighlighted = false;
 
@@ -129,13 +135,26 @@ export function HudOverlay({
     leapHighlighted = true;
   } else if (isOnFoot) {
     leapActionTitle = 'Recall Bike';
-    leapActionSub = 'Vault Back On Chrome';
+    leapActionSub = hijackCooling
+      ? `Bike Ready · Hijack ${hijackSecs}s`
+      : 'Vault Back On Chrome';
     leapAccent = '#8cff2e';
     leapHighlighted = true;
   }
 
   return (
     <div className="pointer-events-none fixed inset-0 z-10 flex flex-col justify-between p-2 sm:p-4">
+      {/* Crimson Impact Flash Vignette on Taking Damage */}
+      {hud.damageFlash > 0.02 && (
+        <div
+          className="pointer-events-none fixed inset-0 z-30 border-[6px] border-[#ff2a54] shadow-[inset_0_0_90px_rgba(255,42,84,0.85)]"
+          style={{
+            opacity: Math.min(1, hud.damageFlash * 0.72),
+            backgroundColor: 'rgba(255, 42, 84, 0.14)',
+          }}
+        />
+      )}
+
       {/* TOP PERIMETER BAR */}
       <div className="relative z-20 flex items-start justify-between gap-2 sm:gap-3">
         {/* TOP-LEFT: Dread, Combo, Wreck/Hijack Telemetry + Monster Radio Tuner */}
@@ -259,65 +278,161 @@ export function HudOverlay({
           )}
         </div>
 
-        {/* TOP-RIGHT: Integrity, MPH, Vehicle Mode, Audio & Prominent Pause */}
+        {/* TOP-RIGHT: Integrity, MPH, Vehicle Mode, Wanted Stars, Audio & Prominent Pause */}
         <div className="flex items-start gap-1.5 sm:gap-2 shrink-0">
-          <div className="bg-[#0e111a]/90 border-2 border-[#2a3142] px-2.5 py-2 sm:px-3.5 sm:py-2.5 min-w-[126px] sm:min-w-[200px] shadow-lg">
-            {/* Integrity Plates */}
-            <div className="flex items-center justify-between gap-2 sm:gap-3">
-              <span className="font-display text-[11px] sm:text-xs tracking-widest uppercase text-[#9aa3b2] hidden sm:inline">
-                Integrity
-              </span>
-              <div className="flex items-center gap-1">
-                {Array.from({ length: hud.maxHp }).map((_, i) => (
-                  <div
-                    key={i}
-                    className={`h-2.5 w-4 sm:w-5 border ${
-                      i < hud.hp
-                        ? isOnFoot
-                          ? 'bg-[#ffd166] border-[#fff1b8]'
-                          : 'bg-[#ff5412] border-[#ffa07a]'
-                        : 'bg-[#1a1f2c] border-[#2e3547]'
-                    }`}
-                  />
-                ))}
-              </div>
-            </div>
-
-            {/* Speed & Vehicle Mode */}
-            <div className="mt-1 sm:mt-1.5 flex items-baseline justify-between gap-1.5 sm:gap-2">
-              <div className="flex items-center gap-1 sm:gap-1.5 text-[11px] sm:text-xs font-semibold truncate max-w-[78px] sm:max-w-none">
-                {isOnFoot ? (
-                  <Footprints className="w-3.5 h-3.5 text-[#ffd166] shrink-0" />
-                ) : isStolen ? (
-                  <Car className="w-3.5 h-3.5 text-[#ff7a29] shrink-0" />
-                ) : (
-                  <Bike className="w-3.5 h-3.5 text-[#8cff2e] shrink-0" />
-                )}
+          <div className="flex flex-col items-end gap-1.5">
+            <div
+              className={`bg-[#0e111a]/90 border-2 px-2.5 py-2 sm:px-3.5 sm:py-2.5 min-w-[136px] sm:min-w-[205px] shadow-lg transition-colors ${
+                hud.damageFlash > 0.12
+                  ? 'border-[#ff2a54] bg-[#2a0c16]/95'
+                  : hud.hp <= 1
+                    ? 'border-[#ff2a54]/80'
+                    : 'border-[#2a3142]'
+              }`}
+            >
+              {/* Integrity / Health Plates */}
+              <div className="flex items-center justify-between gap-2 sm:gap-3">
                 <span
-                  className={`truncate ${
-                    isOnFoot
-                      ? 'text-[#ffd166]'
-                      : isStolen
-                        ? 'text-[#ff7a29]'
-                        : 'text-[#e5e9f0]'
+                  className={`font-mono text-[10px] sm:text-xs font-bold tracking-wider uppercase tabular-nums ${
+                    hud.damageFlash > 0.12 || hud.hp <= 1
+                      ? 'text-[#ff2a54]'
+                      : 'text-[#9aa3b2]'
                   }`}
                 >
-                  {hud.vehicleLabel}
+                  HP {hud.hp}/{hud.maxHp}
                 </span>
+                <div className="flex items-center gap-1">
+                  {Array.from({ length: hud.maxHp }).map((_, i) => (
+                    <div
+                      key={i}
+                      className={`h-2.5 w-3.5 sm:w-5 border ${
+                        i < hud.hp
+                          ? hud.hp <= 1
+                            ? 'bg-[#ff2a54] border-[#ff8fa3]'
+                            : isOnFoot
+                              ? 'bg-[#ffd166] border-[#fff1b8]'
+                              : 'bg-[#ff5412] border-[#ffa07a]'
+                          : 'bg-[#1a1f2c] border-[#2e3547]'
+                      }`}
+                    />
+                  ))}
+                </div>
               </div>
-              <div className="font-mono text-base sm:text-lg font-bold text-[#f4efe6] tabular-nums shrink-0">
-                {hud.mph}
-                <span className="text-[9px] sm:text-[10px] font-normal text-[#9aa3b2] ml-0.5 sm:ml-1">
-                  MPH
-                </span>
+
+              {/* Speed & Vehicle Mode */}
+              <div className="mt-1 sm:mt-1.5 flex items-baseline justify-between gap-1.5 sm:gap-2">
+                <div className="flex items-center gap-1 sm:gap-1.5 text-[11px] sm:text-xs font-semibold truncate max-w-[78px] sm:max-w-none">
+                  {isOnFoot ? (
+                    <Footprints className="w-3.5 h-3.5 text-[#ffd166] shrink-0" />
+                  ) : isStolen ? (
+                    <Car className="w-3.5 h-3.5 text-[#ff7a29] shrink-0" />
+                  ) : (
+                    <Bike className="w-3.5 h-3.5 text-[#8cff2e] shrink-0" />
+                  )}
+                  <span
+                    className={`truncate ${
+                      isOnFoot
+                        ? 'text-[#ffd166]'
+                        : isStolen
+                          ? 'text-[#ff7a29]'
+                          : 'text-[#e5e9f0]'
+                    }`}
+                  >
+                    {hud.vehicleLabel}
+                  </span>
+                </div>
+                <div className="font-mono text-base sm:text-lg font-bold text-[#f4efe6] tabular-nums shrink-0">
+                  {hud.mph}
+                  <span className="text-[9px] sm:text-[10px] font-normal text-[#9aa3b2] ml-0.5 sm:ml-1">
+                    MPH
+                  </span>
+                </div>
               </div>
+
+              {isOnFoot && (
+                <div className="mt-0.5 text-[9px] sm:text-[10px] font-mono font-bold tracking-wider uppercase text-[#ff5c77]">
+                  2× DMG · 2.2× SCARE
+                </div>
+              )}
             </div>
 
-            {isOnFoot && (
-              <div className="mt-0.5 text-[9px] sm:text-[10px] font-mono font-bold tracking-wider uppercase text-[#ff5c77]">
-                2× DMG · 2.2× SCARE
+            {/* 5-STAR WANTED LEVEL & POLICE PURSUIT METER */}
+            <div
+              className={`relative overflow-hidden bg-[#0e111a]/92 border-2 px-2.5 py-1.5 sm:px-3 min-w-[126px] sm:min-w-[200px] shadow-lg transition-colors ${
+                hud.wantedStars >= 1
+                  ? 'border-[#ff2a54]'
+                  : 'border-[#2a3142]'
+              }`}
+            >
+              {/* Red/Blue Police Strobe Strip when Wanted */}
+              {hud.wantedStars >= 1 && (
+                <div className="absolute top-0 left-0 right-0 h-1 flex animate-pulse">
+                  <div className="flex-1 bg-[#ff1e42]" />
+                  <div className="flex-1 bg-[#2563eb]" />
+                </div>
+              )}
+
+              <div className="flex items-center justify-between gap-2">
+                <span
+                  className={`font-display text-[11px] sm:text-xs font-extrabold tracking-widest uppercase ${
+                    hud.wantedStars >= 1 ? 'text-[#ff4d6d]' : 'text-[#6b7280]'
+                  }`}
+                >
+                  Wanted
+                </span>
+                <span
+                  className={`font-mono text-[9px] sm:text-[10px] font-bold uppercase tabular-nums ${
+                    hud.policeChasingCount > 0
+                      ? 'text-[#60a5fa]'
+                      : hud.wantedStars >= 1
+                        ? 'text-[#ffd166]'
+                        : 'text-[#5b6478]'
+                  }`}
+                >
+                  {hud.policeChasingCount > 0
+                    ? `${hud.policeChasingCount} ${hud.policeChasingCount === 1 ? 'COP' : 'COPS'} CHASING`
+                    : hud.wantedStars >= 5
+                      ? 'MANHUNT'
+                      : hud.wantedStars >= 1
+                        ? 'INBOUND'
+                        : 'CLEAR'}
+                </span>
               </div>
-            )}
+
+              <div className="mt-1 flex items-center justify-between gap-0.5 sm:gap-1">
+                {Array.from({ length: 5 }).map((_, idx) => {
+                  const lit = idx < hud.wantedStars;
+                  return (
+                    <Star
+                      key={idx}
+                      className={`w-4 h-4 sm:w-[18px] sm:h-[18px] transition-transform ${
+                        lit
+                          ? hud.wantedStars >= 4
+                            ? 'text-[#ff2a54] fill-[#ff2a54] scale-110 drop-shadow-[0_0_6px_rgba(255,42,84,0.85)]'
+                            : 'text-[#ffd166] fill-[#ffd166] scale-105 drop-shadow-[0_0_5px_rgba(255,209,102,0.7)]'
+                          : 'text-[#283145] fill-[#151a26]'
+                      }`}
+                    />
+                  );
+                })}
+              </div>
+
+              {/* Next-Star Heat Fill Bar */}
+              <div className="mt-1 h-1 w-full bg-[#1a1f2c] overflow-hidden">
+                <div
+                  className="h-full transition-[width] duration-150"
+                  style={{
+                    width: `${Math.round(hud.wantedHeatFrac * 100)}%`,
+                    backgroundColor:
+                      hud.wantedStars >= 4
+                        ? '#ff2a54'
+                        : hud.wantedStars >= 1
+                          ? '#3b82f6'
+                          : '#ffd166',
+                  }}
+                />
+              </div>
+            </div>
           </div>
 
           {/* Touch-friendly Pause & Mute at Top-Right */}
@@ -600,6 +715,15 @@ export function HudOverlay({
                     borderColor: leapHighlighted ? leapAccent : '#2d3447',
                   }}
                 >
+                  {hijackCooling && !hud.captiveTruck?.canLeapToBreak && (
+                    <div
+                      className="absolute bottom-0 left-0 h-1 transition-[width] duration-75"
+                      style={{
+                        width: `${Math.round(hud.hijackCooldownFrac * 100)}%`,
+                        backgroundColor: '#ff7a29',
+                      }}
+                    />
+                  )}
                   <div className="flex items-center justify-between gap-1 text-[10px] font-mono">
                     <span
                       className="font-bold px-1 bg-[#0b0e16] border border-[#30384b]"
@@ -607,14 +731,22 @@ export function HudOverlay({
                     >
                       F
                     </span>
-                    <span className="text-[#9aa3b2] text-[9px] sm:text-[10px]">
+                    <span
+                      className={`text-[9px] sm:text-[10px] tabular-nums ${
+                        hijackCooling && !hud.captiveTruck?.canLeapToBreak
+                          ? 'text-[#ff7a29] font-bold'
+                          : 'text-[#9aa3b2]'
+                      }`}
+                    >
                       {hud.captiveTruck?.canLeapToBreak
                         ? 'RESCUE'
                         : hud.hijackTargetLabel
                           ? 'STEAL'
-                          : isOnFoot
-                            ? 'MOUNT'
-                            : 'STUNT'}
+                          : hijackCooling
+                            ? `HIJACK ${hijackSecs}s`
+                            : isOnFoot
+                              ? 'MOUNT'
+                              : 'STUNT'}
                     </span>
                   </div>
                   <div

@@ -3,7 +3,7 @@ import { getCutoutSpriteTexture, getOpaqueImageTexture, HORROR_ASSETS } from './
 import { buildMonsterFromRiderDef } from './models/monsterBuilder';
 import { RiderDef } from './types';
 
-export type HumanVehicleKind = 'sedan' | 'muscle' | 'van' | 'bike';
+export type HumanVehicleKind = 'sedan' | 'muscle' | 'van' | 'bike' | 'police';
 
 export interface HighwayVehicle {
   id: number;
@@ -14,6 +14,9 @@ export interface HighwayVehicle {
   hijackRing: THREE.Mesh;
   shieldRing?: THREE.Mesh;
   spotlightCone?: THREE.Mesh;
+  policeStrobeL?: THREE.Mesh;
+  policeStrobeR?: THREE.Mesh;
+  policeGlowPool?: THREE.Mesh;
   laneIndex: number; // 0..3
   x: number;
   z: number;
@@ -26,6 +29,10 @@ export interface HighwayVehicle {
   driftVx: number;
   baseDread: number;
   active: boolean;
+  isPolice?: boolean;
+  pursuitTimer?: number;
+  flankSide?: number;
+  ramTimer?: number;
 }
 
 export interface CaptiveTruck {
@@ -546,10 +553,16 @@ export function buildHumanVehicleMesh(
   hijackRing: THREE.Mesh;
   shieldRing?: THREE.Mesh;
   spotlightCone?: THREE.Mesh;
+  policeStrobeL?: THREE.Mesh;
+  policeStrobeR?: THREE.Mesh;
+  policeGlowPool?: THREE.Mesh;
 } {
   const group = new THREE.Group();
   let shieldRing: THREE.Mesh | undefined;
   let spotlightCone: THREE.Mesh | undefined;
+  let policeStrobeL: THREE.Mesh | undefined;
+  let policeStrobeR: THREE.Mesh | undefined;
+  let policeGlowPool: THREE.Mesh | undefined;
 
   let assetUrl: string = HORROR_ASSETS.muscleCar;
   let spriteW = 3.85;
@@ -574,6 +587,16 @@ export function buildHumanVehicleMesh(
     spriteY = spriteH * 0.47;
     barY = 3.7;
     bgThreshold = 218;
+  } else if (kind === 'police') {
+    // High-speed Highway Patrol Police Interceptor Cruiser
+    assetUrl = HORROR_ASSETS.muscleCar;
+    spriteW = 4.05;
+    spriteH = 3.04;
+    spriteY = spriteH * 0.42;
+    barY = 3.35;
+    tintHex = 0x0f172a;
+    tintStrength = 0.24;
+    bgThreshold = 212;
   } else if (kind === 'sedan') {
     assetUrl = HORROR_ASSETS.muscleCar;
     spriteW = 3.65;
@@ -670,6 +693,94 @@ export function buildHumanVehicleMesh(
     group.add(spotlightCone);
   }
 
+  // Police Interceptor 3D Roof Lightbar, Flashing Red/Blue Strobes, Wet-Road Glow & POLICE Badge
+  if (kind === 'police') {
+    const barBase = new THREE.Mesh(
+      new THREE.BoxGeometry(1.55, 0.16, 0.34),
+      new THREE.MeshStandardMaterial({ color: 0x111827, metalness: 0.7, roughness: 0.3 }),
+    );
+    barBase.position.set(0, 1.98, 0.08);
+    group.add(barBase);
+
+    const redLens = new THREE.Mesh(
+      new THREE.BoxGeometry(0.62, 0.22, 0.28),
+      new THREE.MeshBasicMaterial({ color: 0xff1e42 }),
+    );
+    redLens.position.set(-0.42, 2.08, 0.1);
+    const blueLens = new THREE.Mesh(
+      new THREE.BoxGeometry(0.62, 0.22, 0.28),
+      new THREE.MeshBasicMaterial({ color: 0x2563eb }),
+    );
+    blueLens.position.set(0.42, 2.08, 0.1);
+    group.add(redLens, blueLens);
+
+    policeStrobeL = new THREE.Mesh(
+      new THREE.CircleGeometry(0.88, 18),
+      new THREE.MeshBasicMaterial({
+        color: 0xff1e42,
+        transparent: true,
+        opacity: 0.92,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      }),
+    );
+    policeStrobeL.position.set(-0.46, 2.1, 0.28);
+
+    policeStrobeR = new THREE.Mesh(
+      new THREE.CircleGeometry(0.88, 18),
+      new THREE.MeshBasicMaterial({
+        color: 0x3b82f6,
+        transparent: true,
+        opacity: 0.2,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      }),
+    );
+    policeStrobeR.position.set(0.46, 2.1, 0.28);
+    group.add(policeStrobeL, policeStrobeR);
+
+    // Wide flashing Red/Blue reflection pool on the midnight wet highway!
+    policeGlowPool = new THREE.Mesh(
+      new THREE.CircleGeometry(3.4, 24),
+      new THREE.MeshBasicMaterial({
+        color: 0xff1e42,
+        transparent: true,
+        opacity: 0.28,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      }),
+    );
+    policeGlowPool.rotation.x = -Math.PI / 2;
+    policeGlowPool.position.set(0, 0.05, 0.2);
+    group.add(policeGlowPool);
+
+    // Bold white & navy POLICE trunk stripe plate
+    const plateCanvas = document.createElement('canvas');
+    plateCanvas.width = 256;
+    plateCanvas.height = 64;
+    const pg = plateCanvas.getContext('2d');
+    if (pg) {
+      pg.fillStyle = '#0f172a';
+      pg.fillRect(0, 0, 256, 64);
+      pg.strokeStyle = '#f8fafc';
+      pg.lineWidth = 6;
+      pg.strokeRect(4, 4, 248, 56);
+      pg.fillStyle = '#f8fafc';
+      pg.font = '900 40px "Big Shoulders Display", Impact, sans-serif';
+      pg.textAlign = 'center';
+      pg.textBaseline = 'middle';
+      pg.fillText('POLICE', 128, 35);
+    }
+    const plateTex = new THREE.CanvasTexture(plateCanvas);
+    plateTex.colorSpace = THREE.SRGBColorSpace;
+    const policePlate = new THREE.Mesh(
+      new THREE.PlaneGeometry(1.5, 0.36),
+      new THREE.MeshBasicMaterial({ map: plateTex, side: THREE.DoubleSide }),
+    );
+    policePlate.position.set(0, 0.92, 0.14);
+    group.add(policePlate);
+  }
+
   // Floating 3D Panic Bar above vehicle
   const panicBarBg = new THREE.Mesh(
     new THREE.PlaneGeometry(2.4, 0.32),
@@ -702,7 +813,17 @@ export function buildHumanVehicleMesh(
   hijackRing.visible = false;
 
   group.add(panicBarBg, panicBarFill, hijackRing);
-  return { group, panicBarBg, panicBarFill, hijackRing, shieldRing, spotlightCone };
+  return {
+    group,
+    panicBarBg,
+    panicBarFill,
+    hijackRing,
+    shieldRing,
+    spotlightCone,
+    policeStrobeL,
+    policeStrobeR,
+    policeGlowPool,
+  };
 }
 
 // ================================================================

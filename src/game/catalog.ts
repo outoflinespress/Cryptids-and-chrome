@@ -57,7 +57,7 @@ interface PoolSeed {
 const FREE_PACK_RIDERS: RiderDef[] = [
   {
     id: 'bigfoot',
-    poolNumber: 'Free Pack',
+    poolNumber: 'Free Starter',
     collection: 'free',
     name: 'Bigfoot',
     epithet: 'Sasquatch of the Pines',
@@ -91,7 +91,7 @@ const FREE_PACK_RIDERS: RiderDef[] = [
   },
   {
     id: 'pale_rider',
-    poolNumber: 'Free Pack',
+    poolNumber: 'Starter Pack',
     collection: 'free',
     name: 'Pale Rider',
     epithet: 'Chrome Horseman',
@@ -123,7 +123,7 @@ const FREE_PACK_RIDERS: RiderDef[] = [
   },
   {
     id: 'nessie',
-    poolNumber: 'Free Pack',
+    poolNumber: 'Starter Pack',
     collection: 'free',
     name: 'Nessie',
     epithet: 'Highland Hydro-Cruiser',

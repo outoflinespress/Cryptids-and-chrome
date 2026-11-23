@@ -107,7 +107,6 @@ export function GarageModal({
       ...prev,
       dread: prev.dread - cost,
       unlockedRiders: [...prev.unlockedRiders, id],
-      equipped: { ...prev.equipped, rider: id },
     }));
   };
 
@@ -452,10 +451,12 @@ export function GarageModal({
                           className={`px-3.5 py-1.5 font-mono text-xs font-bold uppercase transition-colors ${
                             save.dread >= inspectedRider.cost
                               ? 'bg-[#ff7a29] hover:bg-[#ff944d] text-[#0c0e14] cursor-pointer'
-                              : 'bg-[#1c2130] text-[#6d768a] border border-[#2b3245] cursor-not-allowed'
+                              : 'bg-[#1c2130] text-[#8d96aa] border border-[#2b3245] cursor-not-allowed'
                           }`}
                         >
-                          Early Unlock ({inspectedRider.cost} Dread)
+                          {save.dread >= inspectedRider.cost
+                            ? `Early Unlock (${inspectedRider.cost.toLocaleString()} Dread)`
+                            : `Early Unlock (${inspectedRider.cost.toLocaleString()} Dread) · Need ${(inspectedRider.cost - save.dread).toLocaleString()} more`}
                         </button>
                       </div>
                     )}
@@ -480,7 +481,7 @@ export function GarageModal({
                     [
                       ['all', 'All 51'],
                       ['unlocked', `Unlocked (${save.unlockedRiders.length})`],
-                      ['free', 'Free Pack'],
+                      ['free', 'Starter Pack'],
                       ['pool1', '#1–24'],
                       ['pool2', '#25–48'],
                     ] as const
@@ -601,14 +602,23 @@ export function GarageModal({
                             ? 'bg-[#8cff2e] hover:bg-[#a6ff59] text-[#0c0e14] cursor-pointer'
                             : canAfford
                               ? 'bg-[#ff7a29] hover:bg-[#ff944d] text-[#0c0e14] cursor-pointer'
-                              : 'bg-[#1a1f2d] text-[#6b7488] border border-[#2b3244] cursor-not-allowed'
+                              : 'bg-[#1a1f2d] text-[#8d96aa] border border-[#2b3244] cursor-not-allowed'
                       }`}
                     >
-                      {equipped
-                        ? 'Equipped'
-                        : owned
-                          ? 'Equip Bike'
-                          : `Buy · ${bike.cost}`}
+                      {equipped ? (
+                        'Equipped'
+                      ) : owned ? (
+                        'Equip Bike'
+                      ) : canAfford ? (
+                        `Buy · ${bike.cost.toLocaleString()} Dread`
+                      ) : (
+                        <span className="flex flex-col items-center leading-tight">
+                          <span>Buy · {bike.cost.toLocaleString()} Dread</span>
+                          <span className="font-mono text-[10px] font-normal tracking-normal text-[#9aa3b2] mt-0.5">
+                            Need {(bike.cost - save.dread).toLocaleString()} more Dread
+                          </span>
+                        </span>
+                      )}
                     </button>
                   </div>
                 );
@@ -687,21 +697,30 @@ export function GarageModal({
                                 onClick={() =>
                                   handleBuyOrEquipPart(part.id, slot, part.cost)
                                 }
-                                className={`w-full py-1.5 font-display text-sm tracking-wider uppercase font-bold transition-colors ${
+                                className={`w-full py-1.5 px-2 font-display text-sm tracking-wider uppercase font-bold transition-colors ${
                                   equipped
                                     ? 'bg-[#222a3b] text-[#8cff2e] border border-[#8cff2e]/60 cursor-default'
                                     : owned
                                       ? 'bg-[#8cff2e] hover:bg-[#a6ff59] text-[#0c0e14] cursor-pointer'
                                       : canAfford
                                         ? 'bg-[#ff7a29] hover:bg-[#ff944d] text-[#0c0e14] cursor-pointer'
-                                        : 'bg-[#1a1f2d] text-[#6b7488] border border-[#2b3244] cursor-not-allowed'
+                                        : 'bg-[#1a1f2d] text-[#8d96aa] border border-[#2b3244] cursor-not-allowed'
                                 }`}
                               >
-                                {equipped
-                                  ? 'Installed'
-                                  : owned
-                                    ? 'Install Part'
-                                    : `Buy · ${part.cost} Dread`}
+                                {equipped ? (
+                                  'Installed'
+                                ) : owned ? (
+                                  'Install Part'
+                                ) : canAfford ? (
+                                  `Buy · ${part.cost.toLocaleString()} Dread`
+                                ) : (
+                                  <span className="flex flex-col items-center leading-tight">
+                                    <span>Buy · {part.cost.toLocaleString()} Dread</span>
+                                    <span className="font-mono text-[10px] font-normal tracking-normal text-[#9aa3b2] mt-0.5">
+                                      Need {(part.cost - save.dread).toLocaleString()} more Dread
+                                    </span>
+                                  </span>
+                                )}
                               </button>
                             </div>
                           );
@@ -792,12 +811,25 @@ export function GarageModal({
                             className={`px-3.5 py-2 font-display text-sm tracking-wider uppercase font-bold transition-colors ${
                               canAfford
                                 ? 'bg-[#ff7a29] hover:bg-[#ff944d] text-[#0c0e14] cursor-pointer'
-                                : 'bg-[#1a1f2d] text-[#6b7488] border border-[#2b3244] cursor-not-allowed'
+                                : 'bg-[#1a1f2d] text-[#8d96aa] border border-[#2b3244] cursor-not-allowed'
                             }`}
                           >
-                            {lv === 0
-                              ? `Unlock · ${nextCost}`
-                              : `Upgrade Lv ${lv + 1} · ${nextCost}`}
+                            {canAfford ? (
+                              lv === 0
+                                ? `Unlock · ${nextCost.toLocaleString()} Dread`
+                                : `Upgrade Lv ${lv + 1} · ${nextCost.toLocaleString()} Dread`
+                            ) : (
+                              <span className="flex flex-col items-center leading-tight">
+                                <span>
+                                  {lv === 0
+                                    ? `Unlock · ${nextCost.toLocaleString()} Dread`
+                                    : `Upgrade Lv ${lv + 1} · ${nextCost.toLocaleString()} Dread`}
+                                </span>
+                                <span className="font-mono text-[10px] font-normal tracking-normal text-[#9aa3b2] mt-0.5">
+                                  Need {(nextCost - save.dread).toLocaleString()} more Dread
+                                </span>
+                              </span>
+                            )}
                           </button>
                         ) : (
                           <div className="px-3.5 py-1.5 font-mono text-xs font-bold text-[#8cff2e] border border-[#8cff2e]/50 bg-[#1a241b] text-center">
@@ -868,21 +900,30 @@ export function GarageModal({
                       onClick={() =>
                         handleBuyOrToggleCosmetic(cos.id, cos.cost)
                       }
-                      className={`w-full py-2 font-display text-base tracking-wider uppercase font-bold transition-colors ${
+                      className={`w-full py-2 px-2 font-display text-base tracking-wider uppercase font-bold transition-colors ${
                         equipped
                           ? 'bg-[#222a3b] hover:bg-[#2d374e] text-[#8cff2e] border border-[#8cff2e]/60 cursor-pointer'
                           : owned
                             ? 'bg-[#8cff2e] hover:bg-[#a6ff59] text-[#0c0e14] cursor-pointer'
                             : canAfford
                               ? 'bg-[#ff7a29] hover:bg-[#ff944d] text-[#0c0e14] cursor-pointer'
-                              : 'bg-[#1a1f2d] text-[#6b7488] border border-[#2b3244] cursor-not-allowed'
+                              : 'bg-[#1a1f2d] text-[#8d96aa] border border-[#2b3244] cursor-not-allowed'
                       }`}
                     >
-                      {equipped
-                        ? 'Equipped (Click to Remove)'
-                        : owned
-                          ? 'Equip Accessory'
-                          : `Buy · ${cos.cost} Dread`}
+                      {equipped ? (
+                        'Equipped (Click to Remove)'
+                      ) : owned ? (
+                        'Equip Accessory'
+                      ) : canAfford ? (
+                        `Buy · ${cos.cost.toLocaleString()} Dread`
+                      ) : (
+                        <span className="flex flex-col items-center leading-tight">
+                          <span>Buy · {cos.cost.toLocaleString()} Dread</span>
+                          <span className="font-mono text-[10px] font-normal tracking-normal text-[#9aa3b2] mt-0.5">
+                            Need {(cos.cost - save.dread).toLocaleString()} more Dread
+                          </span>
+                        </span>
+                      )}
                     </button>
                   </div>
                 );

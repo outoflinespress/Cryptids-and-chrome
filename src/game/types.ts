@@ -63,6 +63,7 @@ export type VehicleControlMode =
   | 'stolen_sedan'
   | 'stolen_muscle'
   | 'stolen_van'
+  | 'stolen_police'
   | 'stolen_bike'
   | 'on_foot';
 
@@ -267,12 +268,15 @@ export interface HudSnapshot {
   comboTimerFrac: number;
   hp: number;
   maxHp: number;
+  damageFlash: number;
   mph: number;
   nitroFrac: number;
   nitroActive: boolean;
   controlMode: VehicleControlMode;
   vehicleLabel: string;
   hijackTargetLabel: string | null;
+  hijackCooldownSec: number;
+  hijackCooldownFrac: number; // 0..1 (1 = ready)
   inDarkness: boolean;
   inSpotlightWarning: boolean;
   captiveTruck: CaptiveHudInfo | null;
@@ -281,6 +285,9 @@ export interface HudSnapshot {
   signatureReadyFrac: number;
   signatureColor: string;
   scareSlots: ScareSlotState[];
+  wantedStars: number; // 0..5
+  wantedHeatFrac: number; // 0..1 progress to next star
+  policeChasingCount: number;
   statusToast: string | null;
   callouts: FloatingCallout[];
 }

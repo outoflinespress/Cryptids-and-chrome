@@ -11,10 +11,10 @@ import prisonTruckImgUrl from '../assets/images/prison_truck_straight_rear_17951
 import bigfoot3dUrl from '../assets/images/bigfoot_3d_rear_1795171437480.jpg';
 import mothman3dUrl from '../assets/images/mothman_3d_rear_1795171440384.jpg';
 import banshee3dUrl from '../assets/images/banshee_3d_rear_1795171439959.jpg';
-import paleRider3dUrl from '../assets/images/pale_rider_3d_rear_1795171438267.jpg';
-import grimReaper3dUrl from '../assets/images/grim_reaper_3d_rear_1795171440080.jpg';
+import paleRider3dUrl from '../assets/images/pale_rider_dead_rear_1795405143642.jpg';
+import grimReaper3dUrl from '../assets/images/grim_reaper_straight_rear_1795405120674.jpg';
 import nessie3dUrl from '../assets/images/nessie_3d_rear_1795171439107.jpg';
-import cryptidChopper3dUrl from '../assets/images/cryptid_chopper_3d_rear_1795171438206.jpg';
+import cryptidChopper3dUrl from '../assets/images/cryptid_chopper_straight_rear_1795405122424.jpg';
 
 export const HORROR_ASSETS = {
   sky: skyImgUrl,
